@@ -1,7 +1,12 @@
+import {RELEASE_DOCS} from "./release-docs.js";
+import {handleMobileRest, manageMobileBridge, ensureMobileSchema} from "./mobile-bridge.js";
+import {extractEmbeddedArt, MAX_ID3_ART_READ, MAX_EMBEDDED_IMAGE} from "./embedded-art.js";
 // Music app Worker: public listening + admin management.
 // Storage: R2 (mp3 files + artwork, binding MUSIC) and D1 (library, playlists, reactions, admin hash, sessions, binding DB).
 
 // Salted PBKDF2 hash of the first-time admin password. Change it from the admin page after first login.
+const BUILD_VERSION = "16.0.0";
+const BUILD_LABEL = "Mobile Bridge · OpenSubsonic Staging";
 const DEFAULT_SALT = "9756e918a7545f9eec461ee48491018a";
 const DEFAULT_HASH = "539db4ea2054366abc97375b551b16c115622e1a89b8f9cf75cea28345c6ba26";
 
@@ -32,6 +37,62 @@ const json = (data, status = 200, headers = {}) =>
   });
 const clean = (v, max = 200) => String(v ?? "").trim().slice(0, max);
 
+// v14: only public, session-independent JSON is eligible for shared caching.
+// Cache API entries are regional and expire automatically. Login, account,
+// private playlist, lyric requests, and admin responses are NEVER cached here.
+const PUBLIC_CACHE_TTLS = Object.freeze({
+  "/api/tracks": 45,
+  "/api/playlists": 45,
+  "/api/user-playlists": 45,
+  "/api/site": 120,
+  "/api/entity-reactions": 5,
+  "/api/track-reaction-counts": 5,
+  "/api/recent-listens": 10,
+});
+const CACHE_REV = "wasp-v15-0-6";
+const publicRevision = url => /^[a-f0-9-]{1,40}$/i.test(url.searchParams.get("v") || "") ? url.searchParams.get("v") : "";
+const cacheFor = (req, url) => req.method === "GET" && (!url.search || (url.searchParams.size===1 && !!publicRevision(url))) && PUBLIC_CACHE_TTLS[url.pathname]
+  ? (typeof caches !== "undefined" && caches.default ? caches.default : null) : null;
+const cachedKey = url => new Request(`${url.origin}${url.pathname}?__wasp_cache=${CACHE_REV}&v=${publicRevision(url)}`);
+async function cachedPublicResponse(req, url) {
+  const cache=cacheFor(req,url);
+  if (!cache) return null;
+  try {
+    const hit=await cache.match(cachedKey(url));
+    if (!hit) return null;
+    const h=new Headers(hit.headers);h.set("x-wasp-cache","HIT");
+    return new Response(hit.body,{status:hit.status,headers:h});
+  } catch {return null;}
+}
+async function storePublicResponse(req,url,res,ctx) {
+  const cache=cacheFor(req,url), ttl=PUBLIC_CACHE_TTLS[url.pathname];
+  if (!cache || !ttl || !res.ok || res.headers.has("set-cookie")) return res;
+  const h=new Headers(res.headers);
+  // Browsers must revalidate; Cloudflare's edge can reuse the public JSON.
+  h.set("cache-control",`public, max-age=0, s-maxage=${ttl}`);
+  h.set("x-wasp-cache","MISS");
+  const output=new Response(res.body,{status:res.status,statusText:res.statusText,headers:h});
+  const job=cache.put(cachedKey(url),output.clone()).catch(()=>{});
+  if (ctx?.waitUntil) ctx.waitUntil(job); else await job;
+  return output;
+}
+function invalidatePublicCache(req,url,res,ctx) {
+  if(req.method === "GET" || !res.ok || typeof caches === "undefined" || !caches.default) return;
+  const path=url.pathname;
+  const paths=new Set();
+  if(path === "/api/internal/folder-index" || path.startsWith("/api/admin/tracks/") || path === "/api/admin/upload" || path === "/api/admin/clean") paths.add("/api/tracks");
+  if(path.startsWith("/api/admin/playlists") || path === "/api/admin/clean") paths.add("/api/playlists");
+  if(path.startsWith("/api/user/playlists") || path === "/api/admin/clean") paths.add("/api/user-playlists");
+  if(path === "/api/admin/settings" || path === "/api/admin/favicon" || path === "/api/admin/brand-image") paths.add("/api/site");
+  if(path === "/api/admin/network") {
+    for(const p of Object.keys(PUBLIC_CACHE_TTLS)) paths.add(p);
+  }
+  if(!paths.size) return;
+  const jobs=[...paths].map(p=>caches.default.delete(cachedKey(new URL(p,url.origin))).catch(()=>{}));
+  if(ctx?.waitUntil) ctx.waitUntil(Promise.all(jobs));
+}
+
+
 // CORS for peer network: when sharing is on, public library endpoints are readable by other instances.
 const CORS_PEER = {
   "access-control-allow-origin": "*",
@@ -53,10 +114,222 @@ function withCors(res, share) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
 }
 
+
+const COMMUNITY_SCHEMA = [
+  "CREATE TABLE IF NOT EXISTS user_peer_permissions (user_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS user_published_peers (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,url TEXT NOT NULL,name TEXT NOT NULL DEFAULT '',track_count INTEGER NOT NULL DEFAULT 0,last_ok INTEGER,last_error TEXT,last_checked INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,UNIQUE(user_id,url))",
+  "CREATE INDEX IF NOT EXISTS idx_user_peers_owner ON user_published_peers(user_id)",
+  "CREATE TABLE IF NOT EXISTS user_voter_tokens (user_id TEXT NOT NULL,voter TEXT NOT NULL,PRIMARY KEY(user_id,voter))",
+  "CREATE TABLE IF NOT EXISTS user_publish_requests (user_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS user_publish_approval_notices (user_id TEXT PRIMARY KEY, approved_at INTEGER NOT NULL, viewed_at INTEGER NOT NULL DEFAULT 0)",
+];
+async function upgradeCommunitySchema(DB) {
+  for (const sql of COMMUNITY_SCHEMA) await DB.prepare(sql).run();
+  await DB.prepare("INSERT INTO settings(key,value) VALUES('wasp_schema_version','15.3') ON CONFLICT(key) DO UPDATE SET value='15.3'").run();
+}
+// Independent additive migration: do not re-run community upgrades or rewrite
+// an existing library just to add short-lived anonymous streaming presence.
+async function upgradeActiveStreamsSchema(DB) {
+  const marker=await DB.prepare("SELECT value FROM settings WHERE key='wasp_live_streams_schema'").first();
+  if(marker?.value==='2')return;
+  // Preserve v15.0.7 active sessions; add a stable start timestamp so the
+  // 30 newest songs are ranked by the moment a stream began, NOT its heartbeat.
+  await DB.prepare(`CREATE TABLE IF NOT EXISTS active_streams (
+    session_id TEXT PRIMARY KEY, origin TEXT NOT NULL DEFAULT '', track_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL, started_at INTEGER NOT NULL DEFAULT 0)`).run();
+  const columns=(await DB.prepare('PRAGMA table_info(active_streams)').all()).results;
+  if(!columns.some(c=>c.name==='started_at'))
+    await DB.prepare('ALTER TABLE active_streams ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_active_streams_expiry ON active_streams(expires_at)').run();
+  await DB.prepare("INSERT INTO settings(key,value) VALUES('wasp_live_streams_schema','2') ON CONFLICT(key) DO UPDATE SET value='2'").run();
+}
+// Renewed every 25 seconds by an *actually playing* WASP audio element.
+// Expiration is intentionally short so a crashed browser cannot show as live.
+const STREAM_TTL_MS = 65000;
+// Explicit per-user overrides win over the global default. A missing row means
+// "inherit global" so newly registered accounts receive the current default.
+const PUBLISH_DEFAULT_SQL = "COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key='user_publish_default'),0)";
+const EFFECTIVE_PUBLISH_SQL = `COALESCE(p.enabled,${PUBLISH_DEFAULT_SQL})`;
+async function globalPublishDefault(DB) {
+  return Number((await DB.prepare("SELECT value FROM settings WHERE key='user_publish_default'").first())?.value||0)===1;
+}
+async function userMayPublish(DB,userId) {
+  const row=await DB.prepare(`SELECT COALESCE((SELECT enabled FROM user_peer_permissions WHERE user_id=?),${PUBLISH_DEFAULT_SQL}) AS enabled`).bind(userId).first();
+  return !!row?.enabled;
+}
+async function createPublishApprovalNotice(DB,userId) {
+  await DB.prepare(`INSERT INTO user_publish_approval_notices(user_id,approved_at,viewed_at) VALUES(?,?,0)
+    ON CONFLICT(user_id) DO UPDATE SET approved_at=excluded.approved_at,viewed_at=0`).bind(userId,Date.now()).run();
+}
+async function approvePublishRequest(DB,userId) {
+  const pending=await DB.prepare('SELECT user_id FROM user_publish_requests WHERE user_id=?').bind(userId).first();
+  if(!pending)return false;
+  await DB.batch([
+    DB.prepare('DELETE FROM user_publish_requests WHERE user_id=?').bind(userId),
+    DB.prepare(`INSERT INTO user_publish_approval_notices(user_id,approved_at,viewed_at) VALUES(?,?,0)
+      ON CONFLICT(user_id) DO UPDATE SET approved_at=excluded.approved_at,viewed_at=0`).bind(userId,Date.now()),
+  ]);
+  return true;
+}
+// User-contributed URLs must not reach Tailscale, localhost, cloud metadata, or
+// Docker's internal services. Administrator-managed peers retain their own policy.
+function publicWaspOrigin(input) {
+  if(typeof input!=='string'||input.length>250)throw Error('Use a publicly reachable HTTPS WASP hostname.');
+  let u;try{u=new URL(input.trim());}catch{throw Error('Enter a full HTTPS link.');}
+  if(u.protocol!=='https:'||u.username||u.password||u.port||u.search||u.hash||
+     (u.pathname!=='/'&&u.pathname!==''))throw Error('Use only the HTTPS homepage URL (without a path, port, or credentials).');
+  const h=u.hostname.toLowerCase().replace(/\.$/,'');
+  if(!h.includes('.')||h.length>253||!h.split('.').every(p=>/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(p))||
+     /(?:^|\.)(?:localhost|local|internal|test|invalid|example|onion|home|lan)$/.test(h)||
+     /^\d+\.\d+\.\d+\.\d+$/.test(h)||h.includes(':')||h.endsWith('.arpa'))
+    throw Error('Only public DNS hostnames are allowed for user-published peers.');
+  return 'https://'+h;
+}
+function publicIPAddress(address) {
+  if(/^\d+\.\d+\.\d+\.\d+$/.test(address)) {
+    const n=address.split('.').map(Number);
+    if(n.some(v=>v<0||v>255))return false;
+    const [a,b,c]=n;
+    return a>=1&&a<224&&a!==10&&a!==127&&a!==0&&
+      !(a===100&&b>=64&&b<=127)&&!(a===169&&b===254)&&
+      !(a===172&&b>=16&&b<=31)&&!(a===192&&(b===0||b===168||b===88&&c===99||b===0&&c===2))&&
+      !(a===198&&(b===18||b===19||b===51&&c===100))&&
+      !(a===203&&b===0&&c===113);
+  }
+  // Global-unicast IPv6 only; exclude documentation and special-use blocks.
+  if(address.includes(':'))return /^[23][0-9a-f]{3}:/i.test(address) && !/^2001:db8:/i.test(address);
+  return false;
+}
+async function publicPeerDNS(hostname) {
+  // Check DNS A and AAAA answers before making a user-requested server-side
+  // request. A host that resolves to private, loopback or link-local space is
+  // rejected. The network administrator should additionally restrict egress;
+  // DNS can change between this check and the TLS connection.
+  let current=hostname;
+  for(let depth=0;depth<4;depth++) {
+    const answers=await Promise.all(['A','AAAA'].map(async type=>{
+      const q=new URL('https://cloudflare-dns.com/dns-query');
+      q.searchParams.set('name',current);q.searchParams.set('type',type);
+      const r=await fetch(q.href,{redirect:'manual',headers:{accept:'application/dns-json'},signal:AbortSignal.timeout(4000)});
+      if(!r.ok)return null;
+      const v=await r.json().catch(()=>null);
+      return v&&v.Status===0&&Array.isArray(v.Answer||[]) ? v.Answer||[] : null;
+    }));
+    if(answers.some(a=>!a))return false;
+    const rows=answers.flat(),addresses=rows.filter(r=>r.type===1||r.type===28).map(r=>String(r.data||''));
+    if(addresses.length)return addresses.every(publicIPAddress);
+    const cname=rows.find(r=>r.type===5)?.data;
+    if(!cname)return false;
+    try {current=new URL(publicWaspOrigin('https://'+String(cname).replace(/\.$/,''))).hostname;}
+    catch{return false;}
+  }
+  return false;
+}
+async function probeCommunityPeer(origin) {
+  try {
+    if(!(await publicPeerDNS(new URL(origin).hostname)))return {online:false,error:'Peer hostname is not publicly reachable'};
+    const r=await fetch(origin+'/api/peer',{redirect:'manual',signal:AbortSignal.timeout(6000),
+      headers:{accept:'application/json'}});
+    if(!r.ok||r.status>=300)return {online:false,error:'Peer unavailable'};
+    const size=Number(r.headers.get('content-length')||0);
+    if(size>8192)return {online:false,error:'Invalid peer response'};
+    const reader=r.body?.getReader(),parts=[];let total=0;
+    if(!reader)return {online:false,error:'Empty peer response'};
+    while(true){const {done,value}=await reader.read();if(done)break;
+      total+=value.byteLength;if(total>8192){await reader.cancel().catch(()=>{});return {online:false,error:'Peer response too large'};}
+      parts.push(value);
+    }
+    const bytes=new Uint8Array(total);let offset=0;
+    for(const part of parts){bytes.set(part,offset);offset+=part.byteLength;}
+    let j;try{j=JSON.parse(new TextDecoder().decode(bytes));}catch{return {online:false,error:'Invalid peer response'};}
+    if(j?.ok!==true||!Number.isFinite(Number(j.tracks))||Number(j.tracks)<0||Number(j.tracks)>10000000)
+      return {online:false,error:'Not a sharing WASP server'};
+    return {online:true,name:clean(j.name||j.title||'WASP',80),tracks:Math.floor(Number(j.tracks))};
+  }catch{return {online:false,error:'Peer unreachable'};}
+}
+async function refreshCommunityHealth(DB,limit=60) {
+  const entries=(await DB.prepare(`SELECT l.id,l.url FROM user_published_peers l
+    LEFT JOIN user_peer_permissions p ON p.user_id=l.user_id WHERE ${EFFECTIVE_PUBLISH_SQL}=1
+    ORDER BY l.last_checked ASC LIMIT ?`).bind(limit).all()).results;
+  // Limit concurrent network fetches to avoid overwhelming the Worker and D1.
+  for(let i=0;i<entries.length;i+=5) await Promise.all(entries.slice(i,i+5).map(async entry=>{
+    const status=await probeCommunityPeer(entry.url);
+    await DB.prepare(`UPDATE user_published_peers SET name=CASE WHEN ?!='' THEN ? ELSE name END,
+      track_count=CASE WHEN ? THEN ? ELSE track_count END,
+      last_ok=CASE WHEN ? THEN ? ELSE last_ok END,last_error=?,last_checked=? WHERE id=?`)
+      .bind(status.name||'',status.name||'',status.online?1:0,status.tracks||0,status.online?1:0,Date.now(),
+        status.online?null:status.error,Date.now(),entry.id).run();
+  }));
+}
+async function knownPeer(DB,origin) {
+  return !!((await DB.prepare('SELECT 1 FROM peers WHERE url=?').bind(origin).first()) ||
+    (await DB.prepare(`SELECT 1 FROM user_published_peers l LEFT JOIN user_peer_permissions p
+      ON p.user_id=l.user_id WHERE ${EFFECTIVE_PUBLISH_SQL}=1 AND l.url=? AND l.last_error IS NULL AND l.last_ok IS NOT NULL LIMIT 1`).bind(origin).first()));
+}
+async function recordSignedInVoter(DB,info,voter) {
+  if(info?.role==='user'&&info.user_id)
+    await DB.prepare('INSERT OR IGNORE INTO user_voter_tokens(user_id,voter) VALUES(?,?)').bind(info.user_id,voter).run();
+}
+
 let ready;
 function init(env) {
   return (ready ??= (async () => {
     const q = (s) => env.DB.prepare(s);
+    // v14: migration work is one-time. A new Worker isolate checks one indexed
+    // settings row instead of trying dozens of CREATE/ALTER statements.
+    let marker;
+    try {marker=await q("SELECT value FROM settings WHERE key = 'wasp_schema_version'").first();}
+    catch {await q("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)").run();}
+    // v15.0.1 repair: repair both v14.0.3 and installations already marked v15.
+    // v15 repair: v14.0.3 incorrectly passed two SQL strings to prepare().
+    // The second (peer_catalogue_chunks) was silently discarded, while the
+    // schema marker was still advanced. Always repair real tables independently
+    // even for already-upgraded v14.3 installations; never reset user data.
+    const additive = [
+      "CREATE TABLE IF NOT EXISTS peer_listens(origin TEXT NOT NULL,remote_id TEXT NOT NULL,plays INTEGER NOT NULL DEFAULT 0,synced_plays INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(origin,remote_id))",
+      "CREATE TABLE IF NOT EXISTS peer_catalogue_cache (peer_id TEXT PRIMARY KEY, tracks TEXT NOT NULL DEFAULT '[]', playlists TEXT NOT NULL DEFAULT '[]', users TEXT NOT NULL DEFAULT '[]', revision TEXT NOT NULL DEFAULT '', synced_at INTEGER NOT NULL DEFAULT 0)",
+      "CREATE TABLE IF NOT EXISTS peer_catalogue_chunks (peer_id TEXT NOT NULL,kind TEXT NOT NULL,shard INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(peer_id,kind,shard))",
+            "CREATE TABLE IF NOT EXISTS recent_listens (id TEXT PRIMARY KEY, track_id TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', remote_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '', cover_url TEXT NOT NULL DEFAULT '', played_at INTEGER NOT NULL)",
+      "CREATE INDEX IF NOT EXISTS idx_recent_listens_time ON recent_listens(played_at DESC)",
+      "CREATE TABLE IF NOT EXISTS file_fingerprints (track_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mtime_ms INTEGER NOT NULL DEFAULT 0, source_path TEXT NOT NULL DEFAULT '', scanned_at INTEGER NOT NULL)",
+      "CREATE INDEX IF NOT EXISTS idx_file_fingerprints_hash ON file_fingerprints(sha256)",
+    ];
+    if (["14","14.2","14.3","15"].includes(marker?.value)) {
+      for (const sql of additive) await q(sql).run();
+      // The older schema also needs the created_at lookup index.
+      await q("CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC)").run();
+      // Advance only after every required DDL operation succeeds.
+      await upgradeCommunitySchema(env.DB);
+      await upgradeActiveStreamsSchema(env.DB);
+      return;
+    }
+    if(marker?.value === "15.3"){await upgradeActiveStreamsSchema(env.DB);return;}
+    if(marker?.value === "15.2") {await upgradeCommunitySchema(env.DB);await upgradeActiveStreamsSchema(env.DB);return;}
+    if(marker?.value === "15.1") {await upgradeCommunitySchema(env.DB);await upgradeActiveStreamsSchema(env.DB);return;}
+    // Multiple Cloudflare isolates may start together across data centers.
+    // A D1-backed lease prevents simultaneous backfills and repeated index
+    // builds from multiplying the free-tier writes on initial deployment.
+    const lease=String(Date.now()+90000);
+    let claimed=false;
+    try {
+      const lock=await q(`INSERT INTO settings(key,value) VALUES('wasp_v14_migration_lease',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        WHERE CAST(settings.value AS INTEGER) < ?`).bind(lease,Date.now()).run();
+      claimed=Number(lock.meta?.changes ?? lock.changes ?? 0)>0;
+      if(!claimed) {
+        for(let attempt=0;attempt<20;attempt++) {
+          await new Promise(resolve=>setTimeout(resolve,500));
+          const marker=await q("SELECT value FROM settings WHERE key = 'wasp_schema_version'").first();
+          if(marker?.value === "15.3") return;
+        }
+        throw new Error("A WASP database migration is still running. Please retry shortly.");
+      }
+    } catch(e) {throw e;}
+    try {
+    // Another isolate may have completed the migration after our first check
+    // but before this isolate acquired the released lease.
+    const afterLease=await q("SELECT value FROM settings WHERE key = 'wasp_schema_version'").first();
+    if(afterLease?.value === "15.3") return;
     // Run each statement on its own. D1 batch() is atomic: one failure rolls the whole
     // batch back, so a hiccup on a new table/index during an upgrade used to take the
     // entire site down. Individual try/catch keeps the site up even if one step fails.
@@ -68,6 +341,11 @@ function init(env) {
       "CREATE TABLE IF NOT EXISTS user_playlist_tracks (playlist_id TEXT NOT NULL, track_id TEXT NOT NULL, added_at INTEGER NOT NULL, PRIMARY KEY (playlist_id, track_id))",
       "CREATE TABLE IF NOT EXISTS playlist_hearts (playlist_id TEXT NOT NULL, voter TEXT NOT NULL, PRIMARY KEY (playlist_id, voter))",
       "CREATE TABLE IF NOT EXISTS peer_track_refs (ref TEXT PRIMARY KEY, origin TEXT NOT NULL, remote_id TEXT NOT NULL, title TEXT, artist TEXT, album TEXT, duration REAL)",
+      "CREATE TABLE IF NOT EXISTS peer_listens (origin TEXT NOT NULL, remote_id TEXT NOT NULL, plays INTEGER NOT NULL DEFAULT 0, synced_plays INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(origin,remote_id))",
+      "CREATE TABLE IF NOT EXISTS peer_catalogue_cache (peer_id TEXT PRIMARY KEY, tracks TEXT NOT NULL DEFAULT '[]', playlists TEXT NOT NULL DEFAULT '[]', users TEXT NOT NULL DEFAULT '[]', revision TEXT NOT NULL DEFAULT '', synced_at INTEGER NOT NULL DEFAULT 0)",
+      "CREATE TABLE IF NOT EXISTS peer_catalogue_chunks (peer_id TEXT NOT NULL,kind TEXT NOT NULL,shard INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(peer_id,kind,shard))",
+      "CREATE TABLE IF NOT EXISTS file_fingerprints (track_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mtime_ms INTEGER NOT NULL DEFAULT 0, source_path TEXT NOT NULL DEFAULT '', scanned_at INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS recent_listens (id TEXT PRIMARY KEY, track_id TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', remote_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '', cover_url TEXT NOT NULL DEFAULT '', played_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS attempts (ip TEXT NOT NULL, ts INTEGER NOT NULL)",
       `CREATE TABLE IF NOT EXISTS tracks (
         id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL,
@@ -76,8 +354,13 @@ function init(env) {
       "CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, created_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS playlist_tracks (playlist_id TEXT NOT NULL, track_id TEXT NOT NULL, added_at INTEGER NOT NULL, PRIMARY KEY (playlist_id, track_id))",
       "CREATE TABLE IF NOT EXISTS reactions (track_id TEXT NOT NULL, voter TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (track_id, voter, kind))",
+      "CREATE TABLE IF NOT EXISTS peer_reaction_tracks (id TEXT PRIMARY KEY, origin TEXT NOT NULL, remote_id TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(origin,remote_id))",
+      "CREATE TABLE IF NOT EXISTS user_song_reactions (user_id TEXT NOT NULL, track_id TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(user_id, track_id, kind))",
       "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS spotify_credentials (id INTEGER PRIMARY KEY CHECK (id = 1), client_id TEXT NOT NULL, secret_cipher TEXT NOT NULL, updated_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS entity_reactions (kind TEXT NOT NULL, entity TEXT NOT NULL, voter TEXT NOT NULL, reaction TEXT NOT NULL, PRIMARY KEY (kind, entity, voter, reaction))",
+      // Non-destructive snapshot for peer playlists receiving local votes.
+      "CREATE TABLE IF NOT EXISTS voted_playlist_cache (id TEXT PRIMARY KEY, origin TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'server', cover_url TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '', track_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS artist_similar (name TEXT PRIMARY KEY, list TEXT NOT NULL, fetched_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS artist_info (name TEXT PRIMARY KEY, text TEXT, url TEXT, wtitle TEXT, rev TEXT, genres TEXT NOT NULL DEFAULT '[]', checked_at INTEGER NOT NULL)",
       `CREATE TABLE IF NOT EXISTS requests (
@@ -100,6 +383,14 @@ function init(env) {
     try { await q("ALTER TABLE user_playlists ADD COLUMN cover_v INTEGER NOT NULL DEFAULT 0").run(); } catch {}
     try { await q("ALTER TABLE user_playlists ADD COLUMN cover_mode TEXT NOT NULL DEFAULT 'copied'").run(); } catch {}
     try { await q("ALTER TABLE peer_track_refs ADD COLUMN cover_url TEXT").run(); } catch {}
+    // Non-destructive metadata cache for peer songs receiving local reactions.
+    // It keeps ranking cards readable when the source peer is temporarily offline.
+    for (const col of [
+      "title TEXT NOT NULL DEFAULT ''", "artist TEXT NOT NULL DEFAULT ''",
+      "album TEXT NOT NULL DEFAULT ''", "duration REAL NOT NULL DEFAULT 0",
+      "cover_url TEXT NOT NULL DEFAULT ''"
+    ]) try { await q(`ALTER TABLE peer_reaction_tracks ADD COLUMN ${col}`).run(); } catch {}
+
     for (const col of ["status TEXT NOT NULL DEFAULT 'active'", "done_at INTEGER", "meta TEXT", "playlist_id TEXT"])
       try { await q(`ALTER TABLE requests ADD COLUMN ${col}`).run(); } catch {}
     for (const col of ["kind TEXT", "members TEXT"])
@@ -107,12 +398,37 @@ function init(env) {
     try { await q("ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'").run(); } catch {}
     try { await q("ALTER TABLE sessions ADD COLUMN user_id TEXT").run(); } catch {}
     try { await q("INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_username', 'admin')").run(); } catch {}
+    // WASP rebrand: update only old product defaults, never user-custom site names.
+    try { await q("INSERT OR IGNORE INTO settings (key,value) VALUES ('site_name','WASP')").run(); } catch {}
+    try { await q("UPDATE settings SET value = 'WASP' WHERE key = 'site_name' AND value IN ('Music','RiffVault','RiffVault 🎧')").run(); } catch {}
+    try { await q("UPDATE settings SET value = 'WASP' WHERE key = 'tab_title' AND value IN ('Music','RiffVault','RiffVault 🎧')").run(); } catch {}
     // Unique index on hash: fails if the library already has duplicate file hashes.
     // Do not take the site down for that; upload logic still dedupes by checking the column.
     try { await q("CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(hash)").run(); } catch (e) {
       console.error("idx_tracks_hash skipped (likely duplicate hashes):", e.message);
     }
     try { await q("CREATE INDEX IF NOT EXISTS idx_reactions_track ON reactions(track_id)").run(); } catch {}
+    // Preserve existing one-way playlist hearts in the unified local charts.
+    // Namespaced voters avoid collisions with SHA-256 visitor IDs.
+    try { await q("INSERT OR IGNORE INTO entity_reactions(kind,entity,voter,reaction) SELECT 'playlist', playlist_id, 'legacy:' || voter, 'heart' FROM playlist_hearts").run(); } catch {}
+    // v14: materialized artist membership, indexed by exact normalized artist
+    // and album. Built non-destructively from the existing catalogue, preserving
+    // multi-artist collaboration names and existing tracks without rewrites.
+    await q("CREATE TABLE IF NOT EXISTS track_artist_map (track_id TEXT NOT NULL, artist_key TEXT NOT NULL, album TEXT NOT NULL DEFAULT '', PRIMARY KEY(track_id, artist_key))").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_track_artist_lookup ON track_artist_map(artist_key, album)").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album)").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created_at DESC)").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_file_fingerprints_hash ON file_fingerprints(sha256)").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_added ON playlist_tracks(playlist_id,added_at)").run();
+    await q("CREATE INDEX IF NOT EXISTS idx_user_playlist_tracks_playlist_added ON user_playlist_tracks(playlist_id,added_at)").run();
+    if(afterLease?.value !== "14") await rebuildArtistMap(env.DB);
+    // Only set the marker after all essential work succeeds; partial migrations
+    // safely retry on the next cold start rather than hiding a missing index.
+    await upgradeCommunitySchema(env.DB);
+    await upgradeActiveStreamsSchema(env.DB);
+    } finally {
+      if(claimed) await q("DELETE FROM settings WHERE key='wasp_v14_migration_lease' AND value=?").bind(lease).run().catch(()=>{});
+    }
   })().catch((e) => { ready = undefined; throw e; }));
 }
 
@@ -163,7 +479,11 @@ async function siteSettings(DB) {
   const rows = (await DB.prepare("SELECT key, value FROM settings").all()).results;
   const s = Object.fromEntries(rows.map((r) => [r.key, r.value]));
   return {
-    name: s.site_name || "Music", title: s.tab_title || "", favicon: Number(s.favicon_v) || 0,
+    name: s.site_name || "WASP", title: s.tab_title || "", favicon: Number(s.favicon_v) || 0,
+    show_brand_icon: s.show_brand_icon === "1",
+    brand_mode: s.brand_mode === "image" ? "image" : "text",
+    brand_v: Number(s.brand_v) || 0,
+    sidebar: {enabled:s.sidebar_enabled==="1",bbcode:Object.prototype.hasOwnProperty.call(s,"sidebar_bbcode")?s.sidebar_bbcode:null,html:s.sidebar_html||""},
     ad: { enabled: s.ad_enabled === "1", html: s.ad_html || "", height: Number(s.ad_height) || 340 },
   };
 }
@@ -207,16 +527,41 @@ function artistsOfRow(r) {
   if (r.artists) { try { const a = JSON.parse(r.artists); if (Array.isArray(a) && a.length) return a; } catch {} }
   return splitArtists(r.artist);
 }
+function artistIndexStatements(DB, row) {
+  const names=[...new Set(artistsOfRow(row).map(normArtist).filter(Boolean))];
+  const statements=[DB.prepare("DELETE FROM track_artist_map WHERE track_id = ?").bind(row.id)];
+  for(const key of names) statements.push(DB.prepare("INSERT OR REPLACE INTO track_artist_map(track_id,artist_key,album) VALUES (?,?,?)").bind(row.id,key,row.album || ""));
+  return statements;
+}
+async function rebuildArtistMap(DB) {
+  const {results}=await DB.prepare("SELECT id,artist,artists,album FROM tracks").all();
+  // No changes to tracks and no deletions of music/playlist content.
+  await DB.prepare("DELETE FROM track_artist_map").run();
+  const values=[];
+  for(const row of results) for(const key of new Set(artistsOfRow(row).map(normArtist).filter(Boolean))) {
+    values.push([row.id,key,row.album||""]);
+  }
+  // Cloudflare D1 permits at most 100 bound parameters per statement.
+  // Each artist mapping has three values; 30 rows = 90 bound parameters.
+  // Use conservative batches to avoid production startup failures.
+  const BATCH_ROWS=30;
+  for(let i=0;i<values.length;i+=BATCH_ROWS) {
+    const items=values.slice(i,i+BATCH_ROWS);
+    await DB.prepare(`INSERT OR REPLACE INTO track_artist_map(track_id,artist_key,album) VALUES ${items.map(()=>"(?,?,?)").join(",")}`)
+      .bind(...items.flat()).run();
+  }
+}
 async function libraryHasArtist(DB, name, album = null) {
-  const sql = `SELECT artist, artists FROM tracks WHERE (instr(artist, ?1) > 0 OR instr(COALESCE(artists, ''), ?1) > 0)${album === null ? "" : " AND album = ?2"} LIMIT 200`;
-  const st = DB.prepare(sql);
-  const rows = (await (album === null ? st.bind(name) : st.bind(name, album)).all()).results;
-  return rows.some((r) => artistsOfRow(r).includes(name));
+  const key=normArtist(name);
+  if(!key) return false;
+  const sql="SELECT 1 FROM track_artist_map WHERE artist_key = ?" + (album===null ? "" : " AND album = ?") + " LIMIT 1";
+  return !!(await (album===null ? DB.prepare(sql).bind(key) : DB.prepare(sql).bind(key,album)).first());
 }
 
 // ---------- artwork ----------
-// Embedded covers (uploaded by the admin page) win. Otherwise Deezer's public search API (no key) is used
-// and the image is cached in R2. Albums use the album cover, artists the artist photo, singles the track's cover.
+// Artist/album/track artwork prefers existing custom covers, then online Deezer
+// images; a missing/unavailable online result falls back to original MP3 APIC
+// artwork (on R2 or, through Docker gateway, the read-only /music folder).
 const norm = (s) => String(s ?? "").toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 const RETRY_MS = 7 * 24 * 3600 * 1000;
 async function artKey(kind, artist, album = "") {
@@ -243,10 +588,76 @@ async function deezerImage(kind, artist, album, title) {
   return null;
 }
 const noArt = (cache) => new Response(null, { status: 404, headers: { "cache-control": cache } });
+// R2 keeps the original MP3 bytes. This bounded range reader recovers APIC
+// frames from older uploads that never received a separate artwork object.
+// It never rewrites the audio, and deliberately ignores Docker folder IDs:
+// their images are served by the local gateway instead of Cloudflare R2.
+async function r2Bytes(obj, limit) {
+  if (!obj) return null;
+  const bytes = new Uint8Array(await (typeof obj.arrayBuffer === "function"
+    ? obj.arrayBuffer() : new Response(obj.body).arrayBuffer()));
+  return bytes.length <= limit ? bytes : null;
+}
+async function embeddedPictureForTrack(env, id) {
+  if (!/^[\w-]{1,64}$/.test(id) || id.startsWith("folder-")) return null;
+  const key = `art/track/${id}`;
+  const saved = await env.MUSIC.get(key);
+  if (saved && ["embedded", "custom"].includes(saved.customMetadata?.source)) {
+    const bytes = await r2Bytes(saved, MAX_EMBEDDED_IMAGE);
+    if (bytes?.length) return { bytes, type: saved.httpMetadata?.contentType || "image/jpeg" };
+  }
+  // A separate miss marker avoids rereading a coverless MP3 for every album
+  // tile. Older art/track "none" markers are NOT trusted: they predate APIC
+  // extraction and may have hidden a real embedded cover.
+  const missKey = `art/apic-miss/${id}`;
+  const miss = await env.MUSIC.get(missKey);
+  if (miss && Date.now() - Number(miss.customMetadata?.at || 0) < RETRY_MS) return null;
+  const rememberMiss = () => env.MUSIC.put(missKey, "", {customMetadata:{source:"none",at:String(Date.now())}});
+  try {
+    const h = await r2Bytes(await env.MUSIC.get(id, { range: { offset: 0, length: 10 } }), 10);
+    if (!h) return null; // a missing object is not proof that a file lacks art
+    if (h.length < 10 || String.fromCharCode(...h.slice(0, 3)) !== "ID3") {await rememberMiss();return null;}
+    const size = ((h[6]&127)<<21)|((h[7]&127)<<14)|((h[8]&127)<<7)|(h[9]&127);
+    if (size <= 0 || size + 10 > MAX_ID3_ART_READ) {await rememberMiss();return null;}
+    const data = await r2Bytes(await env.MUSIC.get(id, { range: { offset: 0, length: size + 10 } }), size + 10);
+    if (!data) return null;
+    const cover = extractEmbeddedArt(data);
+    if (!cover) {await rememberMiss();return null;}
+    await env.MUSIC.put(key, cover.bytes, {
+      httpMetadata: { contentType: cover.type },
+      customMetadata: { source: "embedded", at: String(Date.now()) },
+    });
+    return cover;
+  } catch (error) {
+    console.warn("Embedded artwork unavailable for track", id, error?.message);
+    return null;
+  }
+}
+async function embeddedFallbackForArt(env, kind, artist, album, id) {
+  const candidates = [];
+  if (kind === "track" && id) candidates.push(id);
+  // The artist map also handles tracks credited to several artists. Limit
+  // each lookup to avoid scanning a whole library on a cache miss.
+  if (artist && !/^unknown/i.test(artist)) {
+    const query = `SELECT t.id FROM track_artist_map a JOIN tracks t ON t.id=a.track_id
+      WHERE a.artist_key = ? ${kind === "artist" ? "" : "AND t.album = ?"}
+      ORDER BY t.created_at DESC LIMIT 16`;
+    const args = kind === "artist" ? [normArtist(artist)] : [normArtist(artist), album];
+    try {
+      const rows = (await env.DB.prepare(query).bind(...args).all()).results;
+      for (const row of rows || []) if (!candidates.includes(row.id)) candidates.push(row.id);
+    } catch (error) { console.warn("Embedded artwork candidates unavailable", error?.message); }
+  }
+  for (const candidate of candidates) {
+    const art = await embeddedPictureForTrack(env, candidate);
+    if (art) return art;
+  }
+  return null;
+}
 async function serveArt(env, url) {
   const kind = url.pathname.slice(5); // album | artist | track | playlist
   const p = url.searchParams;
-  if (kind === "playlist") { // an image the admin chose for a playlist
+  if (kind === "playlist") {
     const id = clean(p.get("id"), 64);
     const obj = /^[\w-]+$/.test(id) ? await env.MUSIC.get(`art/playlist/${id}`) : null;
     if (!obj) return noArt("public, max-age=300");
@@ -255,12 +666,12 @@ async function serveArt(env, url) {
     h.set("cache-control", "public, max-age=86400");
     return new Response(obj.body, { headers: h });
   }
-  let artist, album = "", title = "", key;
+  let artist, album = "", title = "", key, id = "";
   if (kind === "track") {
-    const id = clean(p.get("id"), 64);
-    const t = /^[\w-]+$/.test(id) && await env.DB.prepare("SELECT artist, artists, title FROM tracks WHERE id = ?").bind(id).first();
+    id = clean(p.get("id"), 64);
+    const t = /^[\w-]+$/.test(id) && await env.DB.prepare("SELECT artist, artists, title, album FROM tracks WHERE id = ?").bind(id).first();
     if (!t) return noArt("public, max-age=300");
-    artist = artistsOfRow(t)[0]; title = t.title; key = `art/track/${id}`;
+    artist = artistsOfRow(t)[0]; title = t.title; album = t.album; key = `art/track/${id}`;
   } else {
     artist = clean(p.get(kind === "artist" ? "name" : "artist"));
     album = kind === "album" ? clean(p.get("album")) : "";
@@ -271,25 +682,44 @@ async function serveArt(env, url) {
     key = await artKey(kind, artist, album);
   }
   let obj = await env.MUSIC.get(key);
-  if (obj?.customMetadata?.source === "none" && Date.now() - Number(obj.customMetadata.at) > RETRY_MS) obj = null;
+  const negativeRecent = obj?.customMetadata?.source === "none" && Date.now() - Number(obj.customMetadata.at) <= RETRY_MS;
+  if (obj?.customMetadata?.source === "none") obj = null;
   if (!obj) {
-    let src = null;
-    if (!/^unknown/i.test(artist)) {
-      try { src = await deezerImage(kind, artist, album, title); } catch { return noArt("no-store"); }
+    // Prefer the requested external cover, but ALWAYS attempt original MP3
+    // embedded artwork when the online search is missing or unavailable.
+    let src = null, onlineFailed = false;
+    if (!negativeRecent && !/^unknown/i.test(artist)) {
+      try { src = await deezerImage(kind, artist, album, title); }
+      catch { onlineFailed = true; }
     }
-    if (!src) {
-      await env.MUSIC.put(key, "", { customMetadata: { source: "none", at: String(Date.now()) } });
-      return noArt("public, max-age=300");
+    if (src) {
+      try {
+        const img = await fetch(src);
+        const type = (img.headers.get("content-type") || "").split(";")[0];
+        if (img.ok && /^image\/(jpeg|png|webp)$/.test(type)) {
+          await env.MUSIC.put(key, await img.arrayBuffer(), {
+            httpMetadata: { contentType: type }, customMetadata: { source: "deezer", at: String(Date.now()) },
+          });
+          obj = await env.MUSIC.get(key);
+        } else onlineFailed = true;
+      } catch { onlineFailed = true; }
     }
-    const img = await fetch(src);
-    const type = img.headers.get("content-type") || "";
-    if (!img.ok || !type.startsWith("image/")) return noArt("no-store");
-    await env.MUSIC.put(key, await img.arrayBuffer(), {
-      httpMetadata: { contentType: type }, customMetadata: { source: "deezer", at: String(Date.now()) },
-    });
-    obj = await env.MUSIC.get(key);
+    if (!obj) {
+      const embedded = await embeddedFallbackForArt(env, kind, artist, album, id);
+      if (embedded) {
+        await env.MUSIC.put(key, embedded.bytes, {
+          httpMetadata: { contentType: embedded.type },
+          customMetadata: { source: "embedded", at: String(Date.now()) },
+        });
+        obj = await env.MUSIC.get(key);
+      }
+    }
+    if (!obj) {
+      if (!negativeRecent && !onlineFailed)
+        await env.MUSIC.put(key, "", { customMetadata: { source: "none", at: String(Date.now()) } });
+      return noArt(onlineFailed ? "no-store" : "public, max-age=300");
+    }
   }
-  if (obj.customMetadata?.source === "none") return noArt("public, max-age=300");
   const h = new Headers();
   obj.writeHttpMetadata(h);
   h.set("cache-control", "public, max-age=3600");
@@ -387,6 +817,84 @@ async function spotifyPlaylist(raw) {
   const title = clean(ov.title, 120) || (ev && ev.name) || "Spotify playlist";
   const image = safeImage(ov.thumbnail_url) || (ev && ev.image) || null;
   return { kind: "playlist", title, artist: "", album: "", image, url: link, dedupe: `playlist|${m[1]}`, meta: ev && ev.tracks.length ? playlistMeta(ev.tracks) : null };
+}
+// Private Spotify credentials saved by an administrator. The client secret is
+// AES-GCM encrypted with an installation key that lives outside D1:
+// SPOTIFY_SETTINGS_KEY, or the existing persistent Docker SCANNER_SECRET.
+// No secret is returned to a browser or stored in the site's public settings.
+function spotifySettingsKey(env) {
+  return String(env.SPOTIFY_SETTINGS_KEY || env.SCANNER_SECRET || "").trim();
+}
+async function spotifyCipherKey(env) {
+  const passphrase = spotifySettingsKey(env);
+  if (passphrase.length < 24) throw new Error("Credential encryption requires SPOTIFY_SETTINGS_KEY (or the Docker installation secret). Set it on the server before saving.");
+  const material = await crypto.subtle.digest("SHA-256", enc.encode("WASP-SPOTIFY-SETTINGS-v1\0" + passphrase));
+  return crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+function bytesTo64(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
+}
+function bytesFrom64(str) {
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+async function encryptSpotifySecret(env, secret) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await spotifyCipherKey(env);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode("wasp-spotify-v1") }, key, enc.encode(secret));
+  return "v1:" + bytesTo64(iv) + ":" + bytesTo64(ciphertext);
+}
+async function decryptSpotifySecret(env, cipher) {
+  const parts = String(cipher).split(":");
+  if (parts.length !== 3 || parts[0] !== "v1") throw new Error("Unknown encrypted Spotify credentials format.");
+  const key = await spotifyCipherKey(env);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytesFrom64(parts[1]), additionalData: enc.encode("wasp-spotify-v1") }, key, bytesFrom64(parts[2]));
+  return new TextDecoder().decode(plain);
+}
+async function spotifySavedConfig(env) {
+  return env.DB.prepare("SELECT client_id, secret_cipher, updated_at FROM spotify_credentials WHERE id = 1").first();
+}
+async function spotifyCredentials(env) {
+  const saved = await spotifySavedConfig(env);
+  if (saved) return { id: saved.client_id, secret: await decryptSpotifySecret(env, saved.secret_cipher), source: "admin" };
+  return { id: String(env.SPOTIFY_CLIENT_ID || "").trim(), secret: String(env.SPOTIFY_CLIENT_SECRET || "").trim(), source: "environment" };
+}
+function spotifyConfigResponse(saved, env, locked = false) {
+  const eid = String(env.SPOTIFY_CLIENT_ID || "").trim(), es = String(env.SPOTIFY_CLIENT_SECRET || "").trim();
+  return {
+    client_id: saved?.client_id || eid,
+    secret_configured: !!saved || !!(eid && es),
+    saved_in_admin: !!saved,
+    source: saved ? "admin" : (eid && es ? "environment" : "none"),
+    updated_at: saved?.updated_at || null,
+    storage_ready: spotifySettingsKey(env).length >= 24,
+    locked,
+  };
+}
+// Optional Spotify Web API playlist search. Credentials are server-side secrets.
+let spotifyAuthCache={id:"",token:"",expires:0};
+async function spotifySearchPlaylists(env, q) {
+  let id, secret;
+  try { ({ id, secret } = await spotifyCredentials(env)); }
+  catch { return json({error:"Saved Spotify credentials could not be unlocked. Ask the administrator to check the server encryption key."},503); }
+  if (!id || !secret) return json({error:"Spotify playlist search is not configured. An administrator can add credentials under Admin → Requests → Spotify settings. You can still paste a playlist link."},503);
+  const cacheKey = id + ":" + await sha256(secret);
+  if (spotifyAuthCache.id!==cacheKey || spotifyAuthCache.expires<Date.now()) {
+    const token=await fetch("https://accounts.spotify.com/api/token",{method:"POST",
+      headers:{authorization:"Basic "+btoa(id+":"+secret),"content-type":"application/x-www-form-urlencoded"},
+      body:"grant_type=client_credentials",signal:AbortSignal.timeout(10000)});
+    if(!token.ok)return json({error:"Spotify rejected the configured credentials. Please check the Spotify app and permissions."},502);
+    const payload=await token.json();
+    if(!payload.access_token)return json({error:"Spotify did not provide a valid access token."},502);
+    spotifyAuthCache={id:cacheKey,token:payload.access_token,expires:Date.now()+(Math.max(60,Number(payload.expires_in)||3600)-30)*1000};
+  }
+  const target="https://api.spotify.com/v1/search?"+new URLSearchParams({q,type:"playlist",limit:"10"});
+  const r=await fetch(target,{headers:{authorization:"Bearer "+spotifyAuthCache.token,accept:"application/json"},signal:AbortSignal.timeout(10000)});
+  if(!r.ok)return json({error:r.status===429?"Spotify search rate limit reached. Try again later.":"Spotify search is unavailable for these credentials (HTTP "+r.status+"). You can still paste a playlist link."},502);
+  const results=await r.json();
+  const playlists=(results.playlists?.items||[]).filter(x=>x&&/^[A-Za-z0-9]{10,40}$/.test(x.id||""));
+  return json(playlists.map(x=>({id:x.id,title:clean(x.name,120),
+    sub:[x.owner?.display_name||x.owner?.id, Number.isFinite(x.items?.total)?x.items.total+" songs":null].filter(Boolean).join(" · "),
+    image: safeImage(x.images?.[0]?.url),url:"https://open.spotify.com/playlist/"+x.id})));
 }
 // which Spotify songs are already in the library? lib = rows of tracks
 function matchPlaylist(lib, tracks) {
@@ -755,6 +1263,176 @@ async function serveLyrics(env, url) {
 const TRACK_COLS = `t.id, t.title, t.artist, t.artists, t.album, t.track_no, t.duration, t.plays, t.created_at,
   COALESCE(SUM(r.kind = 'heart'), 0) AS hearts, COALESCE(SUM(r.kind = 'like'), 0) AS likes, COALESCE(SUM(r.kind = 'dislike'), 0) AS dislikes`;
 
+async function touchCatalogue(DB) {
+  // A single indexed row makes new uploads and playlists discoverable across
+  // Cloudflare POPs without relying on a local cache purge in one data center.
+  await DB.prepare("INSERT INTO settings(key,value) VALUES('catalog_revision',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .bind(crypto.randomUUID()).run();
+}
+function changesCatalogue(path) {
+  return path === "/api/internal/folder-index" || path === "/api/admin/upload" ||
+    path === "/api/admin/clean" || path.startsWith("/api/admin/tracks/") ||
+    path.startsWith("/api/admin/playlists") || path.startsWith("/api/admin/requests/") ||
+    path.startsWith("/api/user/playlists");
+}
+async function catalogueVersion(DB) {
+  const row=await DB.prepare("SELECT value FROM settings WHERE key='catalog_revision'").first();
+  return row?.value || "0";
+}
+
+const CRON_TYPES = ["peers","artwork","biography","hash"];
+const CRON_DEFAULT_JOB = {enabled:false,frequency:"daily",time:"02:00",weekday:0,monthday:1,sync_catalogue:false};
+function cronConfigDefault() {
+  return {timezone:"Asia/Manila",jobs:Object.fromEntries(CRON_TYPES.map(x=>[x,{...CRON_DEFAULT_JOB}]))};
+}
+function validateCronConfig(value) {
+  if(!value || typeof value!=="object" || typeof value.timezone!=="string" || value.timezone.length>80)throw Error("Invalid timezone");
+  try {new Intl.DateTimeFormat("en-US",{timeZone:value.timezone}).format(new Date());}catch{throw Error("Timezone is not supported");}
+  const cfg={timezone:value.timezone,jobs:{}};
+  for(const kind of CRON_TYPES){
+    const source=value.jobs?.[kind]||{},frequency=source.frequency||"daily";
+    if(!["daily","weekly","monthly"].includes(frequency))throw Error("Invalid frequency for "+kind);
+    const time=String(source.time||"00:00"),weekday=Number(source.weekday??0),monthday=Number(source.monthday??1);
+    if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(weekday)||weekday<0||weekday>6||!Number.isInteger(monthday)||monthday<1||monthday>30)throw Error("Invalid schedule for "+kind);
+    cfg.jobs[kind]={enabled:source.enabled===true,frequency,time,weekday,monthday,...(kind==="peers"?{sync_catalogue:source.sync_catalogue===true}:{})};
+  }
+  return cfg;
+}
+async function getCronConfig(DB){
+  const row=await DB.prepare("SELECT value FROM settings WHERE key='cron_config'").first();
+  if(!row)return cronConfigDefault();
+  try{return validateCronConfig(JSON.parse(row.value));}catch{return cronConfigDefault();}
+}
+function cronLocalDate(date,timezone) {
+  const parts=new Intl.DateTimeFormat("en-US",{timeZone:timezone,year:"numeric",month:"2-digit",day:"2-digit",weekday:"short",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(date);
+  const p=Object.fromEntries(parts.map(x=>[x.type,x.value]));
+  return {year:p.year,month:p.month,day:Number(p.day),weekday:["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].indexOf(p.weekday),hm:p.hour+":"+p.minute};
+}
+function shouldRunCron(job,local){
+  if(!job?.enabled)return false;
+  if(job.frequency==="daily")return job.time===local.hm;
+  if(local.hm!=="00:00")return false;
+  return job.frequency==="weekly"?job.weekday===local.weekday:job.monthday===local.day;
+}
+async function warmArtistMetadata(env,row,kind){
+  const artists=artistsOfRow(row).slice(0,2);
+  for(const name of artists){
+    if(!name||/^unknown/i.test(name))continue;
+    if(kind==="biography"){
+      // Existing refresh machinery avoids repeating an unchanged Wikipedia lookup.
+      try{await serveBio(env,new URL("https://wasp.invalid/api/bio?name="+encodeURIComponent(name)),null);}catch{}
+    }else{
+      try{await serveArt(env,new URL("https://wasp.invalid/art/artist?name="+encodeURIComponent(name)));}catch{}
+      if(row.album)try{await serveArt(env,new URL("https://wasp.invalid/art/album?artist="+encodeURIComponent(name)+"&album="+encodeURIComponent(row.album)));}catch{}
+    }
+  }
+}
+// Metadata-only peer sync. Audio objects remain exclusively on the source server.
+// Each phase is bounded and independently committed so the admin interface can
+// show real, completed stages instead of a simulated progress animation.
+const SYNC_PHASES=Object.freeze({tracks:["/api/tracks","tracks",6000],playlists:["/api/playlists","playlists",500],users:["/api/user-playlists","users",500]});
+async function syncPeerPhase(env,peer,phase){
+  const spec=SYNC_PHASES[phase];if(!spec)throw Error("Invalid sync stage");
+  // A unique query string opts out of v14 edge-cached catalogue responses.
+  const target=peer.url+spec[0]+"?sync="+crypto.randomUUID();
+  const response=await fetch(target,{headers:{accept:"application/json","cache-control":"no-cache"},signal:AbortSignal.timeout(25000)});
+  if(!response.ok)throw Error("Peer " + phase + " returned HTTP " + response.status);
+  const raw=await response.text();
+  if(raw.length>8000000)throw Error("Peer metadata exceeds the sync size limit");
+  let data;try{data=JSON.parse(raw);}catch{throw Error("Peer metadata is not valid JSON");}
+  if(!Array.isArray(data)||data.length>spec[2])throw Error("Peer returned an invalid " + phase + " catalogue");
+  // Chunk the snapshot so each D1 row stays comfortably below its 2 MB limit.
+  // Never fetch audio or images; these are metadata JSON fragments only.
+  const chunks=[];let segment=[],size=2;
+  for(const item of data){
+    const part=JSON.stringify(item),bytes=new TextEncoder().encode(part).byteLength;
+    if(bytes>240000)throw Error("One peer metadata item exceeds the supported size");
+    if(segment.length && size+bytes+1>240000){chunks.push(JSON.stringify(segment));segment=[];size=2;}
+    segment.push(item);size+=bytes+1;
+  }
+  if(segment.length)chunks.push(JSON.stringify(segment));
+  await env.DB.prepare("INSERT OR IGNORE INTO peer_catalogue_cache(peer_id) VALUES(?)").bind(peer.id).run();
+  const statements=[env.DB.prepare("DELETE FROM peer_catalogue_chunks WHERE peer_id=? AND kind=?").bind(peer.id,phase)];
+  for(let i=0;i<chunks.length;i++)statements.push(env.DB.prepare("INSERT INTO peer_catalogue_chunks(peer_id,kind,shard,body) VALUES(?,?,?,?)").bind(peer.id,phase,i,chunks[i]));
+  statements.push(env.DB.prepare("UPDATE peer_catalogue_cache SET synced_at=? WHERE peer_id=?").bind(Date.now(),peer.id));
+  await env.DB.batch(statements);
+  if(phase==="tracks")await env.DB.prepare("UPDATE peers SET track_count=?,last_ok=?,last_error=NULL WHERE id=?")
+    .bind(data.length,Date.now(),peer.id).run();
+  return {phase,count:data.length};
+}
+async function snapshotPeerRevision(env,peer){
+  let revision="";
+  try {
+    const r=await fetch(peer.url+"/api/catalog-version?sync="+crypto.randomUUID(),{
+      signal:AbortSignal.timeout(6000),headers:{accept:"application/json"}});
+    if(r.ok)revision=clean((await r.json()).revision,80);
+  }catch{}
+  if(revision)await env.DB.prepare("UPDATE peer_catalogue_cache SET revision=? WHERE peer_id=?").bind(revision,peer.id).run();
+  return revision;
+}
+async function syncPeerAll(env,peer){
+  const counts={};for(const phase of Object.keys(SYNC_PHASES)){
+    const result=await syncPeerPhase(env,peer,phase);counts[phase]=result.count;
+  }
+  counts.revision=await snapshotPeerRevision(env,peer);
+  await touchCatalogue(env.DB);
+  return counts;
+}
+async function recordListen(DB,{track_id,origin='',remote_id='',title='',artist='',album='',cover_url=''}){
+  await DB.prepare("INSERT INTO recent_listens (id,track_id,origin,remote_id,title,artist,album,cover_url,played_at) VALUES (?,?,?,?,?,?,?,?,?)")
+    .bind(crypto.randomUUID(),clean(track_id,200),clean(origin,300),clean(remote_id,100),clean(title,200),clean(artist,200),clean(album,200),clean(cover_url,500),Date.now()).run();
+  // Bound storage without a full-table cleanup on every play.
+  if(Math.random()<0.02)await DB.prepare("DELETE FROM recent_listens WHERE id IN (SELECT id FROM recent_listens ORDER BY played_at DESC LIMIT -1 OFFSET 1000)").run();
+}
+async function runCronJob(env,kind){
+  if(kind==="hash")return {queued:!!env.SCANNER_SECRET,local_only:true};
+  if(kind==="peers"){
+    await refreshCommunityHealth(env.DB,8);
+    const rows=(await env.DB.prepare("SELECT id,url,track_count FROM peers ORDER BY added_at LIMIT 60").all()).results;
+    let updated=0;
+    const config=await getCronConfig(env.DB);
+    for(const row of rows){
+      try{
+        const res=await fetch(row.url+"/api/peer",{signal:AbortSignal.timeout(6000),headers:{accept:"application/json"}});
+        if(!res.ok)continue;
+        const json=await res.json();if(!json.ok)continue;
+        const count=Number(json.tracks)||0;
+        if(count!==Number(row.track_count))updated++;
+        await env.DB.prepare("UPDATE peers SET track_count=?,name=?,last_ok=?,last_error=NULL WHERE id=?")
+          .bind(count,clean(json.name)||row.url,Date.now(),row.id).run();
+        if(config.jobs.peers?.sync_catalogue)await syncPeerAll(env,row);
+      }catch{/* Peer remains in registry; transient network errors never delete it. */}
+    }
+    return {checked:rows.length,updated};
+  }
+  const cursorKey="cron_cursor_"+kind;
+  const marker=await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(cursorKey).first();
+  const cursor=Number(marker?.value)||Number.MAX_SAFE_INTEGER;
+  // Bounded indexed scan, never full catalogue scan per scheduled event.
+  let rows=(await env.DB.prepare("SELECT id,artist,artists,album,created_at FROM tracks WHERE created_at < ? ORDER BY created_at DESC LIMIT 8").bind(cursor).all()).results;
+  if(!rows.length)rows=(await env.DB.prepare("SELECT id,artist,artists,album,created_at FROM tracks ORDER BY created_at DESC LIMIT 8").all()).results;
+  for(const row of rows)await warmArtistMetadata(env,row,kind);
+  const next=rows.length?Math.min(...rows.map(x=>Number(x.created_at)||0)):Number.MAX_SAFE_INTEGER;
+  await env.DB.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(cursorKey,String(next)).run();
+  return {checked:rows.length};
+}
+async function runDueCronJobs(env,when=Date.now()) {
+  const config=await getCronConfig(env.DB);
+  if(!CRON_TYPES.some(k=>config.jobs[k]?.enabled))return [];
+  const local=cronLocalDate(new Date(when),config.timezone),results=[];
+  for(const kind of CRON_TYPES){
+    if(!shouldRunCron(config.jobs[kind],local))continue;
+    const runKey=local.year+"-"+local.month+"-"+String(local.day).padStart(2,"0")+"-"+local.hm;
+    const key="cron_last_"+kind;
+    await env.DB.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)").bind(key,"").run();
+    const r=await env.DB.prepare("UPDATE settings SET value=? WHERE key=? AND value<>?").bind(runKey,key,runKey).run();
+    if(Number(r.meta?.changes??r.changes??0)===0)continue;
+    try{results.push({kind,...await runCronJob(env,kind)});}
+    catch(e){console.warn("WASP cron job error:",kind,e.message);results.push({kind,error:"Job failed; see logs"});}
+  }
+  return results;
+}
+
 async function api(req, env, url, ctx) {
   const path = url.pathname;
   const m = req.method;
@@ -762,6 +1440,44 @@ async function api(req, env, url, ctx) {
   let x;
 
   // ---------- public ----------
+  if(path==="/api/catalog-version" && m==="GET") {
+    return json({revision:await catalogueVersion(DB)},200,{"cache-control":"no-store"});
+  }
+  if(path==="/api/peer-plays" && m==="GET") {
+    if(!(await isSharing(DB)))return json({error:"Library is not shared"},403);
+    const rows=(await DB.prepare("SELECT origin,remote_id,(plays-synced_plays) AS plays FROM peer_listens WHERE plays>synced_plays ORDER BY plays DESC LIMIT 3000").all()).results;
+    return json(rows,200,{"cache-control":"no-store"});
+  }
+  if(path==="/api/play-peer" && m==="POST") {
+    const b=await req.json().catch(()=>({}));
+    const origin=clean(b.origin,300).replace(/\/$/,""),remote=clean(b.remote_id,100);
+    if(!origin||!/^[\w-]{1,100}$/.test(remote) || !(await knownPeer(DB,origin)))
+      return json({error:"Unknown peer track"},400);
+    let canonical=origin;
+    try {
+      const aliases=JSON.parse(env.PEER_ORIGIN_ALIASES||"{}");
+      for(const [publicOrigin,bridgeOrigin] of Object.entries(aliases)){
+        if(new URL(bridgeOrigin).origin===origin && new URL(publicOrigin).protocol==="https:")canonical=new URL(publicOrigin).origin;
+      }
+    }catch{}
+    await DB.prepare("INSERT INTO peer_listens(origin,remote_id,plays) VALUES(?,?,1) ON CONFLICT(origin,remote_id) DO UPDATE SET plays=plays+1").bind(canonical,remote).run();
+    await recordListen(DB,{track_id:remote,origin:canonical,remote_id:remote,title:b.title,artist:b.artist,album:b.album,cover_url:b.cover_url});
+    // Docker can send genuine listening events directly to its configured
+    // source peer via Bridge. The source already exposes an anonymous /api/play
+    // counter; this is what lets main Cloudflare charts reflect Docker listens.
+    // Mark a local listen as synced only after the source acknowledges it, so
+    // federation sums never count the same listen twice.
+    if(env.PEER_PLAY_SYNC==="1" && ctx?.waitUntil){
+      ctx.waitUntil((async()=>{
+        try{
+          const response=await fetch(origin+"/api/play/"+encodeURIComponent(remote),{
+            method:"POST",signal:AbortSignal.timeout(6000)});
+          if(response.ok)await DB.prepare("UPDATE peer_listens SET synced_plays=synced_plays+1 WHERE origin=? AND remote_id=? AND synced_plays<plays").bind(canonical,remote).run();
+        }catch{/* Remains locally counted if the peer cannot be reached. */}
+      })());
+    }
+    return json({ok:true});
+  }
   // Peer discovery: other instances probe this to confirm sharing is on and get a friendly name.
   if (path === "/api/peer" && m === "GET") {
     if (!(await isSharing(DB))) return json({ error: "This library is not shared on the network." }, 403);
@@ -772,31 +1488,170 @@ async function api(req, env, url, ctx) {
   // List of peer base URLs this instance has added (so the front-end can pull their tracks).
   if (path === "/api/network/peers" && m === "GET") {
     const rows = (await DB.prepare("SELECT id, url, name, track_count, last_ok, last_error FROM peers ORDER BY added_at").all()).results;
+    const published=(await DB.prepare(`SELECT l.url,l.name,l.track_count,l.last_ok FROM user_published_peers l
+      LEFT JOIN user_peer_permissions p ON p.user_id=l.user_id
+      WHERE ${EFFECTIVE_PUBLISH_SQL}=1 AND l.last_error IS NULL AND l.last_ok IS NOT NULL ORDER BY l.created_at`).all()).results;
+    const known=new Set(rows.map(r=>r.url));
+    for(const p of published)if(!known.has(p.url)){
+      rows.push({id:'community-'+await sha256(p.url),url:p.url,name:p.name||'WASP',track_count:p.track_count,last_ok:p.last_ok,last_error:null,community:true});
+      known.add(p.url);
+    }
+    const primary=(await DB.prepare("SELECT value FROM settings WHERE key='primary_peer_id'").first())?.value||"";
     return json(rows.map((p) => ({
-      id: p.id, url: p.url, name: p.name || p.url,
+      id: p.id, url: p.url, name: p.name || p.url, is_primary:!p.community && p.id===primary, community:!!p.community,
       track_count: p.track_count || 0,
       online: !!(p.last_ok && !p.last_error),
       last_ok: p.last_ok || null,
     })));
   }
+  if(path==="/api/peer-catalogue" && m==="GET"){
+    const rows=(await DB.prepare("SELECT c.peer_id,c.synced_at,c.revision,p.url FROM peer_catalogue_cache c JOIN peers p ON p.id=c.peer_id WHERE c.synced_at>0 ORDER BY p.added_at").all()).results;
+    const shards=(await DB.prepare("SELECT peer_id,kind,shard,body FROM peer_catalogue_chunks ORDER BY peer_id,kind,shard").all()).results;
+    const mapping=new Map(rows.map(row=>[row.peer_id,{peer_id:row.peer_id,origin:row.url,synced_at:row.synced_at,revision:row.revision,tracks:[],playlists:[],users:[]}]));
+    for(const part of shards){const item=mapping.get(part.peer_id);if(item && ["tracks","playlists","users"].includes(part.kind)){
+      item[part.kind].push(...JSON.parse(part.body));
+    }}
+    return json([...mapping.values()],200,{"cache-control":"no-store"});
+  }
+  // Anonymous live playback. A session is an ephemeral random tab ID; never
+  // use cookies, account data, network addresses or user identifiers here.
+  if(path==="/api/active-streams" && m==="GET"){
+    const now=Date.now();
+    if(url.searchParams.get('summary')==='1'){
+      // A separate aggregate provides a *complete* listener count, even when
+      // the song list is capped. Never expose session IDs or account details.
+      const [tally,rows,keys]=await Promise.all([
+        DB.prepare('SELECT COUNT(*) AS total FROM active_streams WHERE expires_at>?').bind(now).first(),
+        DB.prepare(`SELECT origin,track_id,COUNT(*) AS listeners,
+          MAX(CASE WHEN started_at>0 THEN started_at ELSE expires_at-${STREAM_TTL_MS} END) AS started_at
+          FROM active_streams WHERE expires_at>? GROUP BY origin,track_id
+          ORDER BY started_at DESC,origin,track_id LIMIT 30`).bind(now).all(),
+        // Legacy Recently listened streaming icons must still work for songs
+        // outside the 30-card UI cap. Never return per-listener session IDs.
+        DB.prepare(`SELECT origin,track_id FROM active_streams
+          WHERE expires_at>? GROUP BY origin,track_id LIMIT 1000`).bind(now).all(),
+      ]);
+      return json({listener_count:Number(tally?.total)||0,tracks:rows.results,keys:keys.results},200,{"cache-control":"no-store"});
+    }
+    // Keep the legacy array API intact for older v15.0.7/v15.0.8 clients.
+    const rows=(await DB.prepare(`SELECT origin,track_id FROM active_streams
+      WHERE expires_at>? GROUP BY origin,track_id LIMIT 1000`).bind(now).all()).results;
+    return json(rows,200,{"cache-control":"no-store"});
+  }
+  if(path==="/api/active-streams" && m==="POST"){
+    const b=await req.json().catch(()=>({}));
+    const sessionId=typeof b.session_id==='string'?b.session_id:'';
+    if(!/^[a-f0-9-]{36}$/i.test(sessionId))return json({error:'Invalid playback session'},400);
+    const action=b.action;
+    if(action==='stop'){
+      // Only stop this tab's currently reported track; no listener identity.
+      await DB.prepare('DELETE FROM active_streams WHERE session_id=?').bind(sessionId).run();
+      return json({ok:true});
+    }
+    if(action!=='playing')return json({error:'Unknown playback state'},400);
+    const origin=clean(b.origin,300).replace(/\/$/,''),trackId=clean(b.track_id,120);
+    if(!/^[\w-]{1,120}$/.test(trackId))return json({error:'Invalid track'},400);
+    if(origin){
+      let u;try{u=new URL(origin);}catch{return json({error:'Invalid peer origin'},400);}
+      if(u.origin!==origin||!['http:','https:'].includes(u.protocol)||!(await knownPeer(DB,origin)))
+        return json({error:'Unknown peer'},400);
+    }else if(!(await DB.prepare('SELECT 1 FROM tracks WHERE id=?').bind(trackId).first())){
+      return json({error:'Unknown track'},400);
+    }
+    const now=Date.now();
+    await DB.prepare(`INSERT INTO active_streams(session_id,origin,track_id,expires_at,started_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+      started_at=CASE WHEN active_streams.origin=excluded.origin
+        AND active_streams.track_id=excluded.track_id
+        THEN active_streams.started_at ELSE excluded.started_at END,
+      origin=excluded.origin,track_id=excluded.track_id,expires_at=excluded.expires_at`)
+      .bind(sessionId,origin,trackId,now+STREAM_TTL_MS,now).run();
+    // Low-frequency deletion, not a write on every read or heartbeat.
+    if(Math.random()<0.03)await DB.prepare('DELETE FROM active_streams WHERE expires_at<?').bind(Date.now()).run();
+    return json({ok:true});
+  }
+  if(path==="/api/recent-listens" && m==="GET"){
+    const rows=(await DB.prepare("SELECT r.track_id,r.origin,r.remote_id,r.title,r.artist,r.album,r.cover_url,r.played_at,COALESCE(t.plays,p.plays,0) AS plays FROM recent_listens r LEFT JOIN tracks t ON r.origin='' AND t.id=r.track_id LEFT JOIN peer_listens p ON r.origin<>'' AND p.remote_id=r.remote_id AND p.origin=r.origin ORDER BY r.played_at DESC LIMIT 50").all()).results;
+    return json(rows,200,{"cache-control":"no-store"});
+  }
   // Local-only scanner authentication. This secret is never configured on the production Worker.
+  if(path==="/api/internal/cron-tick" && m==="POST") {
+    if(!env.SCANNER_SECRET || req.headers.get("x-scanner-secret")!==env.SCANNER_SECRET)return json({error:"Forbidden"},403);
+    return json({ok:true,runs:await runDueCronJobs(env)},200,{"cache-control":"no-store"});
+  }
   if (path === "/api/internal/folder-index" && m === "POST") {
     if (!env.SCANNER_SECRET || req.headers.get("x-scanner-secret") !== env.SCANNER_SECRET) return json({error:"Forbidden"},403);
     const body = await req.json().catch(() => ({}));
     if (!Array.isArray(body.tracks) || body.tracks.length > 5000) return json({error:"Invalid scan"},400);
     for (const t of body.tracks) {
       if (!/^folder-[a-f0-9]{40}$/.test(t.id)) continue;
-      await DB.prepare("INSERT OR IGNORE INTO tracks (id,title,artist,album,track_no,duration,size,plays,created_at,hash) VALUES (?,?,?,?,?,?,?,0,?,NULL)")
-        .bind(t.id,clean(t.title,200)||"Unknown Track",clean(t.artist,200)||"Unknown Artist",clean(t.album,200)||"Unknown Album",Number(t.track_no)||0,Number(t.duration)||0,Number(t.size)||0,Date.now()).run();
-      await DB.prepare("UPDATE tracks SET title=?,artist=?,album=?,track_no=?,duration=?,size=? WHERE id=?")
-        .bind(clean(t.title,200)||"Unknown Track",clean(t.artist,200)||"Unknown Artist",clean(t.album,200)||"Unknown Album",Number(t.track_no)||0,Number(t.duration)||0,Number(t.size)||0,t.id).run();
+      await DB.prepare("DELETE FROM file_fingerprints WHERE track_id=? AND (size<>? OR mtime_ms<>?)").bind(t.id,Number(t.size)||0,Math.floor(Number(t.mtime)||0)).run();
+      const track={id:t.id,title:clean(t.title,200)||"Unknown Track",artist:clean(t.artist,200)||"Unknown Artist",
+        album:clean(t.album,200)||"Unknown Album",track_no:Number(t.track_no)||0,duration:Number(t.duration)||0,size:Number(t.size)||0};
+      await DB.batch([
+        DB.prepare("INSERT OR IGNORE INTO tracks (id,title,artist,album,track_no,duration,size,plays,created_at,hash) VALUES (?,?,?,?,?,?,?,0,?,NULL)")
+          .bind(track.id,track.title,track.artist,track.album,track.track_no,track.duration,track.size,Date.now()),
+        DB.prepare("UPDATE tracks SET title=?,artist=?,album=?,track_no=?,duration=?,size=? WHERE id=?")
+          .bind(track.title,track.artist,track.album,track.track_no,track.duration,track.size,track.id),
+        ...artistIndexStatements(DB,track),
+      ]);
     }
     return json({ok:true,indexed:body.tracks.length});
+  }
+  // Docker-only scanner API, protected by the per-installation scanner secret.
+  // MP3s are read-only: only their hashes and metadata are stored in D1.
+  if(path==="/api/internal/fingerprints" && m==="GET"){
+    if(!env.SCANNER_SECRET || req.headers.get("x-scanner-secret")!==env.SCANNER_SECRET)return json({error:"Forbidden"},403);
+    const after=clean(url.searchParams.get("after"),100);
+    const rows=(await DB.prepare("SELECT track_id,sha256,size,mtime_ms FROM file_fingerprints WHERE track_id>? ORDER BY track_id LIMIT 500").bind(after).all()).results;
+    return json(rows);
+  }
+  if(path==="/api/internal/fingerprint-index" && m==="POST"){
+    if(!env.SCANNER_SECRET || req.headers.get("x-scanner-secret")!==env.SCANNER_SECRET)return json({error:"Forbidden"},403);
+    const b=await req.json().catch(()=>({}));
+    if(!Array.isArray(b.items)||b.items.length>100)return json({error:"Invalid fingerprint batch"},400);
+    const stmts=[];
+    for(const t of b.items){
+      if(!/^folder-[0-9a-f]{40}$/.test(t.id)||! /^[0-9a-f]{64}$/.test(t.sha256))continue;
+      const path=clean(t.path,1000);
+      stmts.push(DB.prepare("INSERT INTO file_fingerprints(track_id,sha256,size,mtime_ms,source_path,scanned_at) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM tracks WHERE id=?) ON CONFLICT(track_id) DO UPDATE SET sha256=excluded.sha256,size=excluded.size,mtime_ms=excluded.mtime_ms,source_path=excluded.source_path,scanned_at=excluded.scanned_at")
+        .bind(t.id,t.sha256,Math.max(0,Number(t.size)||0),Math.max(0,Math.floor(Number(t.mtime)||0)),path,Date.now(),t.id));
+    }
+    if(stmts.length)await DB.batch(stmts);
+    if(b.status&&typeof b.status==="object"){
+      const state={state:clean(b.status.state,30),total:Number(b.status.total)||0,scanned:Number(b.status.scanned)||0,changed:Number(b.status.changed)||0,updated_at:Date.now(),error:clean(b.status.error,250)};
+      await DB.prepare("INSERT INTO settings(key,value) VALUES('fingerprint_status',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(JSON.stringify(state)).run();
+    }
+    return json({ok:true,saved:stmts.length});
+  }
+  // Reconcile fingerprint metadata with the files currently present under
+  // /music. This only removes stale DB fingerprints, never the source audio
+  // or playlist records. Prevents removed/moved files being counted as
+  // surviving duplicates during a later administrative cleanup.
+  if(path==="/api/internal/fingerprint-prune" && m==="POST"){
+    if(!env.SCANNER_SECRET || req.headers.get("x-scanner-secret")!==env.SCANNER_SECRET)return json({error:"Forbidden"},403);
+    const b=await req.json().catch(()=>({}));
+    if(!Array.isArray(b.ids)||b.ids.length>100||b.ids.some(id=>!/^folder-[a-f0-9]{40}$/.test(id)))return json({error:"Invalid file identifiers"},400);
+    if(b.ids.length)await DB.batch(b.ids.map(id=>DB.prepare("DELETE FROM file_fingerprints WHERE track_id=?").bind(id)));
+    return json({ok:true,removed:b.ids.length});
+  }
+  if(path==="/api/internal/hash-request" && m==="GET"){
+    if(!env.SCANNER_SECRET || req.headers.get("x-scanner-secret")!==env.SCANNER_SECRET)return json({error:"Forbidden"},403);
+    const id=(await DB.prepare("SELECT value FROM settings WHERE key='hash_scan_request'").first())?.value||"";
+    return json({request:id});
   }
   if (path === "/api/tracks" && m === "GET") {
     const { results } = await DB.prepare(
       `SELECT ${TRACK_COLS} FROM tracks t LEFT JOIN reactions r ON r.track_id = t.id GROUP BY t.id ORDER BY t.created_at DESC`).all();
     return json(results.map((t) => { let artists; try { artists = artistsOfRow(t); } catch { artists = [t.artist || "Unknown Artist"]; } return { ...t, artists }; }));
+  }
+  if (path === "/api/track-reaction-counts" && m === "GET") {
+    const {results}=await DB.prepare(`SELECT track_id AS id,
+      COALESCE(SUM(kind='heart'),0) AS hearts,
+      COALESCE(SUM(kind='like'),0) AS likes,
+      COALESCE(SUM(kind='dislike'),0) AS dislikes
+      FROM reactions GROUP BY track_id`).all();
+    return json(results);
   }
   if (path === "/api/playlists" && m === "GET") {
     const pls = (await DB.prepare("SELECT id, name, created_at, cover_v FROM playlists ORDER BY created_at DESC").all()).results;
@@ -819,7 +1674,7 @@ async function api(req, env, url, ctx) {
     if (!auth || auth.role !== "user") return json({error:"Sign in required."},401);
     const b = await req.json().catch(() => ({}));
     const origin = clean(b.origin, 250).replace(/\/$/, ""), remoteId = clean(b.id, 100);
-    const peer = await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(origin).first();
+    const peer = await knownPeer(DB,origin);
     if (!peer || !/^[\w-]{1,100}$/.test(remoteId)) return json({error:"Unknown peer or track."},400);
     const ref = "peer:" + await sha256(origin + "\n" + remoteId);
     const cover = clean(b.cover_url,500);
@@ -829,48 +1684,103 @@ async function api(req, env, url, ctx) {
   }
   if (path === "/api/user-playlists" && m === "GET") {
     const { results } = await DB.prepare("SELECT p.id, p.name, p.user_id, u.username, p.created_at, p.is_public, p.cover_v, p.cover_mode FROM user_playlists p JOIN user_accounts u ON u.id = p.user_id WHERE p.is_public = 1 ORDER BY p.created_at DESC").all();
-    const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
+    const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks ORDER BY added_at, rowid").all()).results;
     const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
-    return json(results.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
+    // Public playlists expose the real audio location for borrowed peer tracks.
+    // Without this map, a peer:sha256 reference is meaningless on a different server.
+    const peerRows=(await DB.prepare("SELECT DISTINCT r.ref, r.origin, r.remote_id, r.title, r.artist, r.album, r.duration, r.cover_url FROM peer_track_refs r JOIN user_playlist_tracks l ON l.track_id = r.ref JOIN user_playlists p ON p.id = l.playlist_id WHERE p.is_public = 1").all()).results;
+    const peerMap=Object.fromEntries(peerRows.map(r=>[r.ref,r]));
+    return json(results.map(p => ({ ...p, tracks: by[p.id] || [],
+      cover_url:p.cover_v && p.cover_mode!=="mosaic" ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null,
+      track_sources:Object.fromEntries((by[p.id]||[]).filter(id=>peerMap[id]).map(id=>[id,peerMap[id]]))
+    })));
   }
   if(path==="/api/playlist-heart" && m==="POST"){
     const b=await req.json().catch(()=>({})), id=clean(b.id,220);
     if(!id)return json({error:"Playlist required."},400);
     const visitor=getCookie(req,"riffvault_heart") || crypto.randomUUID();
-    await DB.prepare("INSERT OR IGNORE INTO playlist_hearts (playlist_id,voter) VALUES (?,?)").bind(id,visitor).run();
-    const row=await DB.prepare("SELECT COUNT(*) AS n FROM playlist_hearts WHERE playlist_id = ?").bind(id).first();
+    const signedIn=await sessionInfo(req,env);
+    if(signedIn?.role==='user'&&signedIn.user_id) {
+      await recordSignedInVoter(DB,signedIn,visitor);
+      await recordSignedInVoter(DB,signedIn,'legacy:'+visitor);
+    }
+    await DB.batch([
+      DB.prepare("INSERT OR IGNORE INTO playlist_hearts (playlist_id,voter) VALUES (?,?)").bind(id,visitor),
+      DB.prepare("INSERT OR IGNORE INTO entity_reactions(kind,entity,voter,reaction) VALUES ('playlist',?,?,'heart')").bind(id,'legacy:'+visitor)
+    ]);
+    const row=await DB.prepare("SELECT COUNT(*) AS n FROM entity_reactions WHERE kind='playlist' AND entity=? AND reaction='heart'").bind(id).first();
     return json({hearts:row.n},200,{"set-cookie":`riffvault_heart=${visitor}; Path=/; SameSite=Lax; Max-Age=31536000`});
   }
   if (path === "/api/site" && m === "GET") return json(await siteSettings(DB));
   if (path === "/api/entity-reactions" && m === "GET") {
     try {
       const { results } = await DB.prepare(`SELECT kind, entity, COALESCE(SUM(reaction = 'heart'), 0) AS hearts, COALESCE(SUM(reaction = 'like'), 0) AS likes, COALESCE(SUM(reaction = 'dislike'), 0) AS dislikes FROM entity_reactions GROUP BY kind, entity`).all();
-      const out = { artist: Object.create(null), playlist: Object.create(null) };
+      const out = { artist: Object.create(null), playlist: Object.create(null), playlist_meta: [] };
       for (const r of results) if (out[r.kind]) out[r.kind][r.entity] = { hearts: r.hearts, likes: r.likes, dislikes: r.dislikes };
+      out.playlist_meta = (await DB.prepare("SELECT id,origin,name,kind,cover_url,username,track_count FROM voted_playlist_cache").all()).results;
       return json(out, 200, { "cache-control": "no-cache" });
     } catch {
-      // Table may not exist yet on a partial upgrade; never take the site down.
-      return json({ artist: {}, playlist: {} }, 200, { "cache-control": "no-cache" });
+      return json({ artist: {}, playlist: {}, playlist_meta: [] }, 200, { "cache-control": "no-cache" });
     }
   }
   if (path === "/api/react-entity" && m === "POST") {
     const b = await req.json().catch(() => ({}));
     const vid = req.headers.get("X-Visitor") || "";
-    const type = b.type, key = clean(b.key, 200), kind = b.kind;
+    const type = b.type, key = clean(b.key, 512), kind = b.kind;
     if (!/^[\w-]{8,64}$/.test(vid) || !["artist", "playlist"].includes(type) || !key || !["heart", "like", "dislike"].includes(kind)) return json({ error: "Bad request." }, 400);
-    const exists = type === "artist" ? await libraryHasArtist(DB, key) : !!(await DB.prepare("SELECT 1 FROM playlists WHERE id = ?").bind(key).first());
-    if (!exists) return json({ error: "Not found." }, 404);
+    const origin = clean(b.origin, 250).replace(/\/$/, "");
+    let trustedRemote = false;
+    if (origin) {
+      try { const u=new URL(origin);if(!["http:","https:"].includes(u.protocol)||u.href.replace(/\/$/,"")!==origin) return json({error:"Invalid peer."},400); }
+      catch { return json({error:"Invalid peer."},400); }
+      trustedRemote = await knownPeer(DB,origin);
+    }
+    if (type === "artist") {
+      const local = await libraryHasArtist(DB, key);
+      // Peer-only artists can receive votes on this server, but the source
+      // must be a configured peer. Voting never alters the source peer.
+      if (!local && !trustedRemote) return json({ error: "Artist not found on this server or a connected peer." }, 404);
+    } else {
+      const managed=await DB.prepare("SELECT 1 FROM playlists WHERE id = ?").bind(key).first();
+      const user=await DB.prepare("SELECT user_id,is_public FROM user_playlists WHERE id = ?").bind(key).first();
+      const sessionUser=user ? await sessionInfo(req,env) : null;
+      const owned=!!user && (user.is_public || (sessionUser && (sessionUser.role==='admin' || sessionUser.user_id===user.user_id)));
+      const remoteId=trustedRemote && key.startsWith(origin+'|') ? key.slice(origin.length+1) : '';
+      const validPeer=!!remoteId && /^[\w-]{1,128}$/.test(remoteId);
+      if (!managed && !owned && !validPeer) return json({ error: "Playlist not found on this server or a connected peer." }, 404);
+      if (validPeer) {
+        const name=clean(b.name,180)||'Peer playlist';
+        const kind=b.playlist_kind==='user'?'user':'server';
+        let cover='';
+        const candidate=clean(b.cover_url,1000);
+        try {
+          if (!candidate) throw new Error('No cover URL');
+          const url=new URL(candidate,origin+'/');
+          // Remote peer artwork must come from the registered source or be
+          // proxied on this server; reject untrusted arbitrary destinations.
+          if(url.origin===origin && ['https:','http:'].includes(url.protocol))cover=url.href.slice(0,1000);
+          else if(candidate.startsWith('/_peer/'))cover=candidate.slice(0,1000);
+        } catch {}
+        await DB.prepare(`INSERT INTO voted_playlist_cache(id,origin,name,kind,cover_url,username,track_count,updated_at)
+          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+          name=excluded.name,kind=excluded.kind,cover_url=CASE WHEN excluded.cover_url!='' THEN excluded.cover_url ELSE voted_playlist_cache.cover_url END,
+          username=excluded.username,track_count=excluded.track_count,updated_at=excluded.updated_at`)
+          .bind(key,origin,name,kind,cover,clean(b.username,64),Math.max(0,Math.min(100000,Number(b.track_count)||0)),Date.now()).run();
+      }
+    }
     const voter = await sha256(vid), stmts = [];
+    await recordSignedInVoter(DB,await sessionInfo(req,env),voter);
+    if (b.on === true) {
+      stmts.push(DB.prepare("INSERT OR IGNORE INTO entity_reactions (kind, entity, voter, reaction) VALUES (?,?,?,?)").bind(type, key, voter, kind));
+      const other = kind === "like" ? "dislike" : kind === "dislike" ? "like" : null;
+      if (other) stmts.push(DB.prepare("DELETE FROM entity_reactions WHERE kind = ? AND entity = ? AND voter = ? AND reaction = ?").bind(type, key, voter, other));
+    } else stmts.push(DB.prepare("DELETE FROM entity_reactions WHERE kind = ? AND entity = ? AND voter = ? AND reaction = ?").bind(type, key, voter, kind));
     try {
-      if (b.on) {
-        stmts.push(DB.prepare("INSERT OR IGNORE INTO entity_reactions (kind, entity, voter, reaction) VALUES (?,?,?,?)").bind(type, key, voter, kind));
-        const other = kind === "like" ? "dislike" : kind === "dislike" ? "like" : null;
-        if (other) stmts.push(DB.prepare("DELETE FROM entity_reactions WHERE kind = ? AND entity = ? AND voter = ? AND reaction = ?").bind(type, key, voter, other));
-      } else stmts.push(DB.prepare("DELETE FROM entity_reactions WHERE kind = ? AND entity = ? AND voter = ? AND reaction = ?").bind(type, key, voter, kind));
       await DB.batch(stmts);
       return json(await DB.prepare(`SELECT COALESCE(SUM(reaction = 'heart'), 0) AS hearts, COALESCE(SUM(reaction = 'like'), 0) AS likes, COALESCE(SUM(reaction = 'dislike'), 0) AS dislikes FROM entity_reactions WHERE kind = ? AND entity = ?`).bind(type, key).first());
-    } catch {
-      return json({ hearts: 0, likes: 0, dislikes: 0 });
+    } catch (e) {
+      console.error('reaction persistence failed:',e);
+      return json({error:'Could not save reaction. Please retry.'},500);
     }
   }
   if (path === "/api/lineup" && m === "GET") { // pictures of the band members (looked up once, then saved)
@@ -880,6 +1790,12 @@ async function api(req, env, url, ctx) {
     if (!row || !row.members) return json({ members: [] });
     let members; try { members = await enrichMembers(env, name, row); } catch { try { members = JSON.parse(row.members); } catch { members = []; } }
     return json({ members }, 200, { "cache-control": "no-cache" });
+  }
+  if (path === "/api/spotify/search-playlists" && m === "GET") {
+    const q=clean(url.searchParams.get("q"),80);
+    if(q.length<2)return json([]);
+    try { return await spotifySearchPlaylists(env,q); }
+    catch { return json({error:"Unable to reach Spotify right now. Paste a playlist link instead."},502); }
   }
   if (path === "/api/suggest" && m === "GET") return suggest(url);
   if (path === "/api/bio" && m === "GET") return serveBio(env, url, ctx);
@@ -938,14 +1854,118 @@ async function api(req, env, url, ctx) {
     if (await inLibrary(DB, item)) return json({ error: "That's already in the library.", code: "in_library" }, 409);
     try {
       if (item.meta) item.meta.matched = matchPlaylist(await libraryRows(DB), item.meta.tracks).matched.length;
+      await recordSignedInVoter(DB,await sessionInfo(req,env),voter);
       await DB.prepare("INSERT INTO requests (id, kind, title, artist, album, image, url, dedupe, voter, ip, created_at, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(crypto.randomUUID(), item.kind, item.title, item.artist || "", item.album || "", item.image, item.url || null, item.dedupe, voter, ipH, Date.now(), item.meta ? JSON.stringify(item.meta) : null).run();
     } catch { return json({ error: "That's already in the queue.", code: "in_queue" }, 409); }
     const { n } = await DB.prepare("SELECT COUNT(*) AS n FROM requests WHERE status = 'active'").first();
     return json({ ok: true, position: n }, 201);
   }
+  // A small, public, read-only snapshot of the currently playing song's
+  // reactions. Browsers poll it for near-real-time counts; no user session is
+  // required and no peer is contacted. Peer identities are scoped by origin.
+  if (path === "/api/reaction-state" && m === "GET") {
+    const visitor=req.headers.get("X-Visitor")||"";
+    const voter=/^[\w-]{8,64}$/.test(visitor)?await sha256(visitor):"";
+    const origin=clean(url.searchParams.get("origin"),250).replace(/\/$/,"");
+    const remoteId=clean(url.searchParams.get("remote_id"),100);
+    const localId=clean(url.searchParams.get("id"),100);
+    let id;
+    if (origin || remoteId) {
+      if (!origin || !/^[\w-]{1,100}$/.test(remoteId)) return json({error:"Invalid peer song."},400);
+      const known=await knownPeer(DB,origin);
+      if (!known) return json({error:"Unknown peer."},404);
+      id="peer-"+await sha256(origin+"\n"+remoteId);
+    } else {
+      if (!/^[\w-]{1,100}$/.test(localId)) return json({error:"Invalid song."},400);
+      const known=await DB.prepare("SELECT 1 FROM tracks WHERE id = ?").bind(localId).first();
+      if (!known) return json({error:"Song unavailable."},404);
+      id=localId;
+    }
+    const counts=await DB.prepare(`SELECT
+      COALESCE(SUM(kind='heart'),0) AS hearts,
+      COALESCE(SUM(kind='like'),0) AS likes,
+      COALESCE(SUM(kind='dislike'),0) AS dislikes,
+      COALESCE(MAX(voter=? AND kind='heart'),0) AS my_heart,
+      COALESCE(MAX(voter=? AND kind='like'),0) AS my_like,
+      COALESCE(MAX(voter=? AND kind='dislike'),0) AS my_dislike
+      FROM reactions WHERE track_id=?`).bind(voter,voter,voter,id).first();
+    return json(counts,200,{"cache-control":"no-store"});
+  }
+  // Peer-song reactions are kept in THIS server's D1. A peer's original
+  // music, reactions and library are never modified by local listeners.
+  if (path === "/api/peer-reactions" && m === "GET") {
+    const visitor = req.headers.get("X-Visitor") || "";
+    const voter = /^[\w-]{8,64}$/.test(visitor) ? await sha256(visitor) : "";
+    const { results } = await DB.prepare(`SELECT p.id, p.origin, p.remote_id,
+      COALESCE(SUM(r.kind = 'heart'),0) AS hearts,
+      COALESCE(SUM(r.kind = 'like'),0) AS likes,
+      COALESCE(SUM(r.kind = 'dislike'),0) AS dislikes,
+      p.title, p.artist, p.album, p.duration, p.cover_url, p.created_at,
+      COALESCE(MAX(r.voter = ? AND r.kind = 'heart'),0) AS my_heart,
+      COALESCE(MAX(r.voter = ? AND r.kind = 'like'),0) AS my_like,
+      COALESCE(MAX(r.voter = ? AND r.kind = 'dislike'),0) AS my_dislike
+      FROM peer_reaction_tracks p LEFT JOIN reactions r ON r.track_id = p.id
+      GROUP BY p.id`).bind(voter,voter,voter).all();
+    return json(results);
+  }
+  if (path === "/api/peer-react" && m === "POST") {
+    const b = await req.json().catch(() => ({}));
+    const origin = clean(b.origin, 250).replace(/\/$/, "");
+    const remoteId = clean(b.remote_id, 100);
+    const vid = req.headers.get("X-Visitor") || "";
+    if (!/^[\w-]{8,64}$/.test(vid) || !["heart","like","dislike"].includes(b.kind) ||
+        !/^[\w-]{1,100}$/.test(remoteId) || !origin) return json({error:"Invalid reaction."},400);
+    const peer = await knownPeer(DB,origin);
+    if (!peer) return json({error:"Unknown peer."},404);
+    const id = "peer-" + await sha256(origin + "\n" + remoteId);
+    const voter = await sha256(vid);
+    const kind = b.kind;
+    const title = clean(b.title, 200), artist = clean(b.artist, 200);
+    const album = clean(b.album, 200);
+    const duration = Math.max(0, Math.min(86400, Number(b.duration) || 0));
+    let cover = "";
+    try {
+      const candidate = new URL(String(b.cover_url || ""));
+      if (["https:", "http:"].includes(candidate.protocol)) cover = clean(candidate.href, 500);
+    } catch {}
+    const statements = [DB.prepare(`INSERT OR IGNORE INTO peer_reaction_tracks
+      (id,origin,remote_id,created_at,title,artist,album,duration,cover_url)
+      VALUES (?,?,?,?,?,?,?,?,?)`).bind(id,origin,remoteId,Date.now(),title,artist,album,duration,cover),
+      DB.prepare(`UPDATE peer_reaction_tracks SET
+        title=CASE WHEN ? != '' THEN ? ELSE title END,
+        artist=CASE WHEN ? != '' THEN ? ELSE artist END,
+        album=CASE WHEN ? != '' THEN ? ELSE album END,
+        duration=CASE WHEN ? > 0 THEN ? ELSE duration END,
+        cover_url=CASE WHEN ? != '' THEN ? ELSE cover_url END WHERE id=?`)
+        .bind(title,title,artist,artist,album,album,duration,duration,cover,cover,id)];
+    if (b.on === true) {
+      statements.push(DB.prepare("INSERT OR IGNORE INTO reactions(track_id,voter,kind) VALUES (?,?,?)").bind(id,voter,kind));
+      const other = kind === "like" ? "dislike" : kind === "dislike" ? "like" : null;
+      if (other) statements.push(DB.prepare("DELETE FROM reactions WHERE track_id = ? AND voter = ? AND kind = ?").bind(id,voter,other));
+    } else {
+      statements.push(DB.prepare("DELETE FROM reactions WHERE track_id = ? AND voter = ? AND kind = ?").bind(id,voter,kind));
+    }
+    const signedIn = await sessionInfo(req,env);
+    await recordSignedInVoter(DB,signedIn,voter);
+    if (signedIn?.role === "user" && signedIn.user_id) {
+      if (b.on === true) {
+        statements.push(DB.prepare("INSERT OR IGNORE INTO user_song_reactions(user_id,track_id,kind) VALUES (?,?,?)").bind(signedIn.user_id,id,kind));
+        const other=kind === "like" ? "dislike" : kind === "dislike" ? "like" : null;
+        if (other) statements.push(DB.prepare("DELETE FROM user_song_reactions WHERE user_id = ? AND track_id = ? AND kind = ?").bind(signedIn.user_id,id,other));
+      } else statements.push(DB.prepare("DELETE FROM user_song_reactions WHERE user_id = ? AND track_id = ? AND kind = ?").bind(signedIn.user_id,id,kind));
+    }
+    await DB.batch(statements);
+    const counts = await DB.prepare(`SELECT COALESCE(SUM(kind = 'heart'),0) AS hearts,
+      COALESCE(SUM(kind = 'like'),0) AS likes, COALESCE(SUM(kind = 'dislike'),0) AS dislikes
+      FROM reactions WHERE track_id = ?`).bind(id).first();
+    return json({ ...counts, origin, remote_id:remoteId });
+  }
   if ((x = path.match(/^\/api\/play\/([\w-]+)$/)) && m === "POST") {
-    await DB.prepare("UPDATE tracks SET plays = plays + 1 WHERE id = ?").bind(x[1]).run();
+    const played = await DB.prepare("UPDATE tracks SET plays = plays + 1 WHERE id = ?").bind(x[1]).run();
+    if(Number(played.meta?.changes ?? played.changes ?? 0) === 0) return json({error:"Track not found"},404);
+    const track=await DB.prepare("SELECT id,title,artist,album FROM tracks WHERE id=?").bind(x[1]).first();
+    if(track)await recordListen(DB,{track_id:track.id,remote_id:track.id,title:track.title,artist:track.artist,album:track.album});
     return json({ ok: true });
   }
   if ((x = path.match(/^\/api\/react\/([\w-]+)$/)) && m === "POST") {
@@ -961,6 +1981,14 @@ async function api(req, env, url, ctx) {
       if (other) stmts.push(DB.prepare("DELETE FROM reactions WHERE track_id = ? AND voter = ? AND kind = ?").bind(id, voter, other));
     } else {
       stmts.push(DB.prepare("DELETE FROM reactions WHERE track_id = ? AND voter = ? AND kind = ?").bind(id, voter, kind));
+    }
+    const signedIn = await sessionInfo(req, env);
+    await recordSignedInVoter(DB,signedIn,voter);
+    if (signedIn?.role === "user" && signedIn.user_id) {
+      if (b.on) {
+        stmts.push(DB.prepare("INSERT OR IGNORE INTO user_song_reactions (user_id,track_id,kind) VALUES (?,?,?)").bind(signedIn.user_id,id,kind));
+        if (kind === "like" || kind === "dislike") stmts.push(DB.prepare("DELETE FROM user_song_reactions WHERE user_id = ? AND track_id = ? AND kind = ?").bind(signedIn.user_id,id,kind === "like" ? "dislike" : "like"));
+      } else stmts.push(DB.prepare("DELETE FROM user_song_reactions WHERE user_id = ? AND track_id = ? AND kind = ?").bind(signedIn.user_id,id,kind));
     }
     await DB.batch(stmts);
     const c = await DB.prepare(
@@ -1022,7 +2050,8 @@ async function api(req, env, url, ctx) {
       return json({ authenticated: true, admin: true, role: "admin", username });
     }
     const u = await DB.prepare("SELECT username FROM user_accounts WHERE id = ?").bind(info.user_id).first();
-    return json({ authenticated: !!u, admin: false, role: "user", username: u?.username || "" });
+    const notice=await DB.prepare('SELECT 1 FROM user_publish_approval_notices WHERE user_id=? AND viewed_at=0').bind(info.user_id).first();
+    return json({ authenticated: !!u, admin: false, role: "user", username: u?.username || "", publish_notice:!!notice });
   }
 
   const auth = await sessionInfo(req, env);
@@ -1030,6 +2059,54 @@ async function api(req, env, url, ctx) {
     // Authenticated user operations; admin credentials are handled separately.
 
     if (!auth || auth.role !== "user") return json({ error: "User login required." }, 401);
+    if (path === "/api/user/mobile-keys" || /^\/api\/user\/mobile-keys\/[\w-]+$/.test(path))
+      return manageMobileBridge(req,env,"user",auth.user_id);
+    if(path==="/api/user/username" && m==="PUT") {
+      const b=await req.json().catch(()=>({})), username=clean(b.username,32);
+      if(!/^[a-zA-Z0-9_-]{3,32}$/.test(username))return json({error:'Username must be 3–32 characters: letters, numbers, _ or -.'},400);
+      const adminName=(await DB.prepare("SELECT value FROM settings WHERE key='admin_username'").first())?.value||'admin';
+      if(['admin',adminName.toLowerCase()].includes(username.toLowerCase()))return json({error:'Reserved administrator username.'},409);
+      const self=await DB.prepare('SELECT salt,hash FROM user_accounts WHERE id=?').bind(auth.user_id).first();
+      if(!self||!safeEq(await pbkdf2(String(b.password||''),self.salt),self.hash))return json({error:'Current password is incorrect.'},403);
+      try {await DB.prepare('UPDATE user_accounts SET username=? WHERE id=?').bind(username,auth.user_id).run();}
+      catch {return json({error:'Username is already in use.'},409);}
+      await touchCatalogue(DB);return json({ok:true,username});
+    }
+    if(path==="/api/user/publish/request" && m==="POST") {
+      if(await userMayPublish(DB,auth.user_id))return json({error:'Publishing is already enabled for your account.'},409);
+      const row=await DB.prepare('SELECT 1 FROM user_publish_requests WHERE user_id=?').bind(auth.user_id).first();
+      if(row)return json({ok:true,pending:true,already_requested:true});
+      await DB.prepare('INSERT INTO user_publish_requests(user_id,requested_at) VALUES(?,?)').bind(auth.user_id,Date.now()).run();
+      return json({ok:true,pending:true},201);
+    }
+    if(path==="/api/user/publish" && m==="GET") {
+      const allowed=await userMayPublish(DB,auth.user_id);
+      const links=(await DB.prepare('SELECT id,url,name,track_count,last_ok,last_error,last_checked FROM user_published_peers WHERE user_id=? ORDER BY created_at DESC').bind(auth.user_id).all()).results;
+      const request=await DB.prepare('SELECT requested_at FROM user_publish_requests WHERE user_id=?').bind(auth.user_id).first();
+      const notice=await DB.prepare('SELECT approved_at FROM user_publish_approval_notices WHERE user_id=? AND viewed_at=0').bind(auth.user_id).first();
+      if(notice)await DB.prepare('UPDATE user_publish_approval_notices SET viewed_at=? WHERE user_id=? AND viewed_at=0').bind(Date.now(),auth.user_id).run();
+      return json({enabled:allowed,request_pending:!!request,approval_seen:!!notice,links:links.map(l=>({...l,online:!!l.last_ok&&!l.last_error}))});
+    }
+    if(path==="/api/user/publish" && m==="POST") {
+      const allowed=await userMayPublish(DB,auth.user_id);
+      if(!allowed)return json({error:'An administrator must enable publishing for your account.'},403);
+      const count=(await DB.prepare('SELECT COUNT(*) AS n FROM user_published_peers WHERE user_id=?').bind(auth.user_id).first()).n;
+      if(count>=8)return json({error:'Maximum 8 links per account.'},429);
+      const b=await req.json().catch(()=>({}));let origin;
+      try{origin=publicWaspOrigin(b.url);}catch(e){return json({error:e.message},400);}
+      if(origin===new URL(req.url).origin)return json({error:'You cannot publish this server as its own peer.'},400);
+      const status=await probeCommunityPeer(origin);
+      if(!status.online)return json({error:'The link is not a reachable, sharing WASP server.'},422);
+      const id=crypto.randomUUID();
+      try{await DB.prepare(`INSERT INTO user_published_peers(id,user_id,url,name,track_count,last_ok,last_error,last_checked,created_at)
+        VALUES(?,?,?,?,?,?,NULL,?,?)`).bind(id,auth.user_id,origin,status.name,status.tracks,Date.now(),Date.now(),Date.now()).run();}
+      catch{return json({error:'This link has already been added by your account.'},409);}
+      await touchCatalogue(DB);return json({ok:true,id,url:origin,name:status.name,online:true,track_count:status.tracks},201);
+    }
+    if((x=path.match(/^\/api\/user\/publish\/([\w-]+)$/))&&m==='DELETE') {
+      await DB.prepare('DELETE FROM user_published_peers WHERE id=? AND user_id=?').bind(x[1],auth.user_id).run();
+      await touchCatalogue(DB);return json({ok:true});
+    }
     if(path==="/api/user/password" && m==="POST"){
       const b=await req.json().catch(()=>({}));const password=String(b.password||""), confirm=String(b.confirm||"");
       if(password.length<8)return json({error:"New password must be at least 8 characters."},400);
@@ -1041,78 +2118,24 @@ async function api(req, env, url, ctx) {
       return json({ok:true});
     }
     if(path==="/api/user/playlists/copy" && m==="POST"){
-      const b=await req.json().catch(()=>({})),name=clean(b.name,80);
-      if(!name || !Array.isArray(b.tracks) || b.tracks.length>2000)return json({error:"Invalid playlist."},400);
-      const id=crypto.randomUUID();
-      const refs=[];
-      for(const raw of b.tracks){const ref=String(raw);if(ref.length>220)continue;
-        if(await DB.prepare("SELECT id FROM tracks WHERE id = ?").bind(ref).first()){refs.push(ref);continue;}
-        if(/^peer:[a-f0-9]{64}$/.test(ref) && await DB.prepare("SELECT ref FROM peer_track_refs WHERE ref = ?").bind(ref).first()){refs.push(ref);continue;}
-        // Remote tracks must be registered via the peer-track-ref API before copying.
+      const b=await req.json().catch(()=>({})), name=clean(b.name,80);
+      if(!name || !Array.isArray(b.tracks) || b.tracks.length>1500)return json({error:"Invalid playlist."},400);
+      const refs=[...new Set(b.tracks.map(String))];
+      for(const ref of refs){
+        if(ref.length>220)return json({error:"Invalid track reference."},400);
+        const local=await DB.prepare("SELECT id FROM tracks WHERE id = ?").bind(ref).first();
+        const remote=/^peer:[a-f0-9]{64}$/.test(ref) && await DB.prepare("SELECT ref FROM peer_track_refs WHERE ref = ?").bind(ref).first();
+        if(!local&&!remote)return json({error:`Unregistered or unavailable track: ${ref}`},409);
       }
-      try{await DB.prepare("INSERT INTO user_playlists (id,user_id,name,is_public,created_at) VALUES (?,?,?,?,?)").bind(id,auth.user_id,name,0,Date.now()).run();}
-      catch{return json({error:"You already have a playlist with that name."},409);}
-      for(const ref of new Set(refs))await DB.prepare("INSERT OR IGNORE INTO user_playlist_tracks (playlist_id,track_id,added_at) VALUES (?,?,?)").bind(id,ref,Date.now()).run();
-      let cover_cached=false;
-      // Copy a native cover from the local server/user playlist directly in R2.
-      // No browser-to-Worker roundtrip and no need to re-download existing artwork.
-      if (b.source_playlist_id && !b.source_origin) {
-        const sourceId=clean(b.source_playlist_id,100);
-        const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND (is_public = 1 OR user_id = ?)").bind(sourceId,auth.user_id).first();
-        const server=await DB.prepare("SELECT id FROM playlists WHERE id = ?").bind(sourceId).first();
-        const sourceKey=owned?`art/user-playlist/${sourceId}`:server?`art/playlist/${sourceId}`:null;
-        if(sourceKey){
-          const image=await env.MUSIC.get(sourceKey);
-          if(image){await env.MUSIC.put(`art/user-playlist/${id}`,await image.arrayBuffer(),{httpMetadata:image.httpMetadata});
-            await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();cover_cached=true;}
-        }
-      }
-      if (!cover_cached && b.cover_url && b.source_origin) {
-        try {
-          const origin = new URL(String(b.source_origin));
-          const peer = await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(origin.origin).first();
-          // Only fetch from a configured peer; no redirects or arbitrary URL fetching.
-          if (peer && origin.protocol === "https:") {
-            const url = new URL(String(b.cover_url),origin.origin);
-            if (url.origin === origin.origin && ["https:"].includes(url.protocol)) {
-              const response = await fetch(url.href,{redirect:"error",signal:AbortSignal.timeout(8000)});
-              const type=(response.headers.get("content-type")||"").split(";")[0];
-              const length=Number(response.headers.get("content-length")||0);
-              if(response.ok && ["image/jpeg","image/png","image/webp"].includes(type) && length<=5*1024*1024) {
-                const bytes=await response.arrayBuffer();
-                if(bytes.byteLength<=5*1024*1024) {
-                  await env.MUSIC.put(`art/user-playlist/${id}`,bytes,{httpMetadata:{contentType:type}});
-                  await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();
-                  cover_cached=true;
-                }
-              }
-            }
-          }
-        } catch(e) { console.warn("Peer cover cache failed",e.message); }
-      }
-      // If the source playlist has no explicit cover, cache artwork from its first
-      // remote track. This keeps the copied playlist visually useful offline.
-      if (!cover_cached && refs.length) {
-        try {
-          const first = await DB.prepare("SELECT origin,remote_id FROM peer_track_refs WHERE ref = ?").bind(refs[0]).first();
-          if (first && new URL(first.origin).protocol === "https:" &&
-              await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(first.origin).first()) {
-            const artUrl = first.origin + "/art/track?id=" + encodeURIComponent(first.remote_id);
-            const response = await fetch(artUrl,{redirect:"error",signal:AbortSignal.timeout(8000)});
-            const type=(response.headers.get("content-type")||"").split(";")[0];
-            const length=Number(response.headers.get("content-length")||0);
-            if(response.ok && ["image/jpeg","image/png","image/webp"].includes(type) && length<=5*1024*1024) {
-              const bytes=await response.arrayBuffer();
-              if(bytes.byteLength<=5*1024*1024){
-                await env.MUSIC.put(`art/user-playlist/${id}`,bytes,{httpMetadata:{contentType:type}});
-                await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();
-                cover_cached=true;
-              }
-            }
-          }
-        } catch(e) { console.warn("Peer track artwork cache failed",e.message); }
-      }
-      return json({id,copied:refs.length,skipped:b.tracks.length-refs.length,cover_cached},201);
+      const id=crypto.randomUUID(), now=Date.now();
+      try {
+        await DB.batch([
+          DB.prepare("INSERT INTO user_playlists (id,user_id,name,is_public,created_at,cover_mode) VALUES (?,?,?,?,?,?)").bind(id,auth.user_id,name,0,now,'mosaic'),
+          ...refs.map((ref,i)=>DB.prepare("INSERT INTO user_playlist_tracks (playlist_id,track_id,added_at) VALUES (?,?,?)").bind(id,ref,now+i))
+        ]);
+      }catch(e){return json({error:e.message?.includes('UNIQUE')?'You already have a playlist with that name.':'Unable to copy playlist.'},409);}
+      // Do not copy or delete audio. New playlists display a nine-tile album-art cover.
+      return json({id,copied:refs.length,skipped:0},201);
     }
     if((x=path.match(/^\/api\/user\/playlists\/([\w-]+)\/cover$/)) && m==="PUT"){
       const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id).first();
@@ -1125,9 +2148,9 @@ async function api(req, env, url, ctx) {
     }
     if (path === "/api/user/playlists" && m === "GET") {
       const pls = (await DB.prepare("SELECT id, name, is_public, created_at, cover_v, cover_mode FROM user_playlists WHERE user_id = ? ORDER BY created_at DESC").bind(auth.user_id).all()).results;
-      const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
+      const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks ORDER BY added_at, rowid").all()).results;
       const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
-      return json(pls.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
+      return json(pls.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v && p.cover_mode!=="mosaic" ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
     }
     if (path === "/api/user/playlists" && m === "POST") {
       const b = await req.json().catch(() => ({})), name = clean(b.name, 80);
@@ -1142,6 +2165,30 @@ async function api(req, env, url, ctx) {
       if (b.cover_mode !== undefined && !["copied","mosaic"].includes(b.cover_mode))return json({error:"Invalid cover mode."},400);
       const r = await DB.prepare("UPDATE user_playlists SET name = COALESCE(?,name), is_public = COALESCE(?,is_public), cover_mode = COALESCE(?,cover_mode) WHERE id = ? AND user_id = ?").bind(b.name ? clean(b.name,80) : null, b.is_public === undefined ? null : (b.is_public?1:0), b.cover_mode ?? null, x[1], auth.user_id).run();
       return json({ ok: true });
+    }
+    // Atomic bulk track updates, with ownership + track validation before any write.
+    // PUT is used by the client-side staged removal (Undo / Save); POST /batch appends.
+    if ((x=path.match(/^\/api\/user\/playlists\/([\w-]+)\/tracks(?:\/(batch))?$/)) &&
+        ((m==="PUT"&&!x[2])||(m==="POST"&&x[2]==="batch"))) {
+      const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id).first();
+      if(!owned)return json({error:"Playlist not found or not owned by you."},404);
+      const b=await req.json().catch(()=>({}));
+      if(!Array.isArray(b.tracks)||b.tracks.length>1500)return json({error:"Invalid track list (maximum 1500)."},400);
+      const refs=[...new Set(b.tracks.map(String))];
+      for(const ref of refs){
+        if(ref.length>220)return json({error:"Invalid track reference."},400);
+        const local=await DB.prepare("SELECT id FROM tracks WHERE id = ?").bind(ref).first();
+        const remote=/^peer:[a-f0-9]{64}$/.test(ref) && await DB.prepare("SELECT ref FROM peer_track_refs WHERE ref = ?").bind(ref).first();
+        if(!local&&!remote)return json({error:"A selected track no longer exists in the catalogue."},409);
+      }
+      const existing=(await DB.prepare("SELECT track_id FROM user_playlist_tracks WHERE playlist_id = ? ORDER BY added_at, rowid").bind(x[1]).all()).results.map(r=>r.track_id);
+      const additions=m==="PUT"?refs:refs.filter(ref=>!existing.includes(ref));
+      const statements=[];
+      if(m==="PUT")statements.push(DB.prepare("DELETE FROM user_playlist_tracks WHERE playlist_id = ?").bind(x[1]));
+      const baseline=Date.now();
+      additions.forEach((ref,i)=>statements.push(DB.prepare("INSERT OR IGNORE INTO user_playlist_tracks (playlist_id,track_id,added_at) VALUES (?,?,?)").bind(x[1],ref,baseline+i)));
+      if(statements.length)await DB.batch(statements);
+      return json({ok:true,added:additions.length,count:m==="PUT"?refs.length:existing.length+additions.length});
     }
     if ((x = path.match(/^\/api\/user\/playlists\/([\w-]+)\/tracks$/)) && m === "POST") {
       const b = await req.json().catch(() => ({}));
@@ -1159,7 +2206,11 @@ async function api(req, env, url, ctx) {
       return json({ok:true});
     }
     if ((x = path.match(/^\/api\/user\/playlists\/([\w-]+)$/)) && m === "DELETE") {
-      await DB.batch([DB.prepare("DELETE FROM user_playlist_tracks WHERE playlist_id = ? AND EXISTS (SELECT 1 FROM user_playlists WHERE id = ? AND user_id = ?)").bind(x[1],x[1],auth.user_id),DB.prepare("DELETE FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id)]);
+      const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id).first();
+      if(!owned)return json({error:"Playlist not found."},404);
+      await DB.batch([DB.prepare("DELETE FROM user_playlist_tracks WHERE playlist_id = ?").bind(x[1]),DB.prepare("DELETE FROM playlist_hearts WHERE playlist_id = ?").bind(x[1]),DB.prepare("DELETE FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id)]);
+      // Only this playlist's dedicated cover is removed: song objects and peer refs remain.
+      await env.MUSIC.delete(`art/user-playlist/${x[1]}`).catch(()=>{});
       return json({ok:true});
     }
     return json({error:"Not found."},404);
@@ -1167,7 +2218,115 @@ async function api(req, env, url, ctx) {
   // ---------- admin only ----------
   const sid = auth?.token;
   if (!sid || auth.role !== "admin") return json({ error: "Admin access required." }, 403);
+  if(path==="/api/admin/mobile-bridge") return manageMobileBridge(req,env,"admin",null);
+  if(path==="/api/admin/version" && m==="GET") return json({version:BUILD_VERSION,label:BUILD_LABEL},200,{"cache-control":"no-store"});
+  if(path==="/api/admin/docs" && m==="GET") {
+    const name=url.searchParams.get("name");
+    if(!name)return json(RELEASE_DOCS.map(d=>({name:d.name})),200,{"cache-control":"private, no-store"});
+    const doc=RELEASE_DOCS.find(d=>d.name===name);
+    return doc?json(doc,200,{"cache-control":"private, no-store"}):json({error:"Document not found"},404);
+  }
+  if(path==="/api/admin/crons" && m==="GET") {
+    return json(await getCronConfig(DB),200,{"cache-control":"no-store"});
+  }
+  if(path==="/api/admin/crons" && m==="PUT") {
+    const data=await req.json().catch(()=>null);
+    let config;try{config=validateCronConfig(data);}catch(e){return json({error:e.message},400);}
+    await DB.prepare("INSERT INTO settings(key,value) VALUES('cron_config',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(JSON.stringify(config)).run();
+    return json({ok:true,config},200,{"cache-control":"no-store"});
+  }
 
+
+  if(path==="/api/admin/users/publish-default" && m==="GET")
+    return json({enabled:await globalPublishDefault(DB)});
+  if(path==="/api/admin/users/publish-default" && m==="PUT") {
+    const b=await req.json().catch(()=>({}));
+    if(typeof b.enabled!=='boolean')return json({error:'Invalid publishing default.'},400);
+    await DB.prepare(`INSERT INTO settings(key,value) VALUES('user_publish_default',?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).bind(b.enabled?'1':'0').run();
+    // Approve only requests whose effective permission is now enabled. Per-user
+    // explicit denials continue to override the global checkbox.
+    if(b.enabled){
+      const pending=(await DB.prepare('SELECT user_id FROM user_publish_requests').all()).results;
+      for(const item of pending)if(await userMayPublish(DB,item.user_id))await approvePublishRequest(DB,item.user_id);
+    }
+    await touchCatalogue(DB);
+    return json({ok:true,enabled:b.enabled});
+  }
+  if(path==="/api/admin/users/publish-notifications" && m==="GET") {
+    const {n}=await DB.prepare('SELECT COUNT(*) AS n FROM user_publish_requests').first();
+    return json({pending:Number(n)||0});
+  }
+  // Admin users may count healthy community peers, but never receive their URLs.
+  if (path === "/api/admin/users" && m === "GET") {
+    await refreshCommunityHealth(DB,8);
+    const { results } = await DB.prepare(`
+      SELECT u.id, u.username, u.created_at,
+        COALESCE((SELECT enabled FROM user_peer_permissions x WHERE x.user_id=u.id),${PUBLISH_DEFAULT_SQL}) AS can_publish,
+        (SELECT 1 FROM user_publish_requests pr WHERE pr.user_id=u.id) AS publish_requested,
+        (SELECT COUNT(*) FROM user_published_peers l WHERE l.user_id=u.id) AS provided_links,
+        (SELECT COUNT(*) FROM user_published_peers l WHERE l.user_id=u.id AND l.last_ok IS NOT NULL AND l.last_error IS NULL AND COALESCE((SELECT enabled FROM user_peer_permissions p WHERE p.user_id=u.id),${PUBLISH_DEFAULT_SQL})=1) AS online_links,
+        (SELECT COUNT(*) FROM user_song_reactions r WHERE r.user_id=u.id AND r.kind='heart') AS heart_songs,
+        (SELECT COUNT(*) FROM user_song_reactions r WHERE r.user_id=u.id AND r.kind='like') AS like_songs,
+        (SELECT COUNT(*) FROM user_song_reactions r WHERE r.user_id=u.id AND r.kind='dislike') AS dislike_songs,
+        (SELECT COUNT(*) FROM user_playlists p WHERE p.user_id=u.id AND p.is_public=0) AS private_playlists,
+        (SELECT COUNT(*) FROM user_playlists p WHERE p.user_id=u.id AND p.is_public=1) AS public_playlists
+      FROM user_accounts u ORDER BY u.created_at DESC, u.username COLLATE NOCASE`).all();
+    return json(results);
+  }
+  if((x=path.match(/^\/api\/admin\/users\/([\w-]+)\/publish$/))&&m==='PUT') {
+    const user=await DB.prepare('SELECT id FROM user_accounts WHERE id=?').bind(x[1]).first();
+    if(!user)return json({error:'User not found.'},404);
+    const b=await req.json().catch(()=>({}));
+    if(typeof b.enabled!=='boolean')return json({error:'Invalid permission.'},400);
+    const previouslyAllowed=await userMayPublish(DB,user.id);
+    await DB.prepare(`INSERT INTO user_peer_permissions(user_id,enabled) VALUES(?,?)
+      ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled`).bind(user.id,b.enabled?1:0).run();
+    if(b.enabled){
+      const fromRequest=await approvePublishRequest(DB,user.id);
+      if(!fromRequest&&!previouslyAllowed)await createPublishApprovalNotice(DB,user.id);
+    }
+    await touchCatalogue(DB);return json({ok:true,enabled:b.enabled});
+  }
+  if((x=path.match(/^\/api\/admin\/users\/([\w-]+)$/))&&m==='DELETE') {
+    const b=await req.json().catch(()=>({}));
+    if(String(b.confirm||'').trim()!=='delete')return json({error:'Type delete to confirm.'},400);
+    const row=await DB.prepare("SELECT salt,hash FROM admin WHERE id='admin'").first();
+    if(!row||!safeEq(await pbkdf2(String(b.password||''),row.salt),row.hash))return json({error:'Administrator password is incorrect.'},403);
+    const user=await DB.prepare('SELECT id FROM user_accounts WHERE id=?').bind(x[1]).first();
+    if(!user)return json({error:'User not found.'},404);
+    const images=(await DB.prepare('SELECT id FROM user_playlists WHERE user_id=?').bind(user.id).all()).results;
+    await ensureMobileSchema(DB); // Revoke any app credentials atomically with account deletion.
+    // Atomic D1 removal of user-owned data. Music files and other users' playlists are retained.
+    await DB.batch([
+      DB.prepare(`DELETE FROM user_playlist_tracks WHERE playlist_id IN (SELECT id FROM user_playlists WHERE user_id=?)`).bind(user.id),
+      DB.prepare(`DELETE FROM playlist_hearts WHERE playlist_id IN (SELECT id FROM user_playlists WHERE user_id=?)`).bind(user.id),
+      DB.prepare(`DELETE FROM entity_reactions WHERE kind='playlist' AND entity IN (SELECT id FROM user_playlists WHERE user_id=?)`).bind(user.id),
+      DB.prepare(`DELETE FROM voted_playlist_cache WHERE id IN (SELECT id FROM user_playlists WHERE user_id=?)`).bind(user.id),
+      DB.prepare('DELETE FROM user_playlists WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_song_reactions WHERE user_id=?').bind(user.id),
+      // A visitor cookie can be shared by different signed-in accounts on the
+      // same browser. Never erase another account's aggregate interactions.
+      DB.prepare(`DELETE FROM playlist_hearts WHERE voter IN (SELECT t.voter FROM user_voter_tokens t
+        WHERE t.user_id=? AND NOT EXISTS (SELECT 1 FROM user_voter_tokens other WHERE other.voter=t.voter AND other.user_id<>?))`).bind(user.id,user.id),
+      DB.prepare(`DELETE FROM reactions WHERE voter IN (SELECT t.voter FROM user_voter_tokens t
+        WHERE t.user_id=? AND NOT EXISTS (SELECT 1 FROM user_voter_tokens other WHERE other.voter=t.voter AND other.user_id<>?))`).bind(user.id,user.id),
+      DB.prepare(`DELETE FROM entity_reactions WHERE voter IN (SELECT t.voter FROM user_voter_tokens t
+        WHERE t.user_id=? AND NOT EXISTS (SELECT 1 FROM user_voter_tokens other WHERE other.voter=t.voter AND other.user_id<>?))`).bind(user.id,user.id),
+      DB.prepare(`DELETE FROM requests WHERE voter IN (SELECT t.voter FROM user_voter_tokens t
+        WHERE t.user_id=? AND NOT EXISTS (SELECT 1 FROM user_voter_tokens other WHERE other.voter=t.voter AND other.user_id<>?))`).bind(user.id,user.id),
+      DB.prepare('DELETE FROM user_voter_tokens WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_published_peers WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_peer_permissions WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_publish_requests WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_publish_approval_notices WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM mobile_bridge_keys WHERE user_id=?').bind(user.id),
+      DB.prepare('DELETE FROM user_accounts WHERE id=?').bind(user.id),
+    ]);
+    await Promise.all(images.map(p=>env.MUSIC.delete('art/user-playlist/'+p.id).catch(()=>{})));
+    await touchCatalogue(DB);return json({ok:true});
+  }
   if (path === "/api/admin/bio/refresh" && m === "POST") {
     const b = await req.json().catch(() => ({}));
     const name = clean(b.name);
@@ -1184,7 +2343,25 @@ async function api(req, env, url, ctx) {
     const b = await req.json().catch(() => ({}));
     const stmts = [];
     const set = (k, v) => stmts.push(DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(k, String(v)));
-    if ("site_name" in b) set("site_name", clean(b.site_name, 60) || "Music");
+    if ("site_name" in b) set("site_name", clean(b.site_name, 60) || "WASP");
+    if ("brand_mode" in b) {
+      if(!["text","image"].includes(b.brand_mode))return json({error:"Invalid branding mode"},400);
+      set("brand_mode",b.brand_mode);
+    }
+    if ("sidebar_enabled" in b) set("sidebar_enabled",b.sidebar_enabled?"1":"0");
+    if ("sidebar_bbcode" in b) {
+      const code=String(b.sidebar_bbcode??"");
+      if(code.length>8000)return json({error:"Sidebar BBCode exceeds 8,000 characters."},400);
+      set("sidebar_bbcode",code);
+    }
+    // Retained solely for backwards compatibility with installations that
+    // already store HTML credits. New clients only save safe BBCode.
+    if ("sidebar_html" in b) {
+      const h=String(b.sidebar_html??"");
+      if(h.length>25000)return json({error:"Sidebar code exceeds 25,000 characters."},400);
+      set("sidebar_html",h);
+    }
+    if ("show_brand_icon" in b) set("show_brand_icon", b.show_brand_icon ? "1" : "0");
     if ("tab_title" in b) set("tab_title", clean(b.tab_title, 80));
     if ("ad_enabled" in b) set("ad_enabled", b.ad_enabled ? "1" : "0");
     if ("ad_html" in b) {
@@ -1195,6 +2372,21 @@ async function api(req, env, url, ctx) {
     if ("ad_height" in b) set("ad_height", Math.min(1000, Math.max(60, parseInt(b.ad_height, 10) || 340)));
     if (stmts.length) await DB.batch(stmts);
     return json(await siteSettings(DB));
+  }
+  if (path === "/api/admin/brand-image") {
+    if (m === "PUT") {
+      const type=req.headers.get("content-type")||"",size=Number(req.headers.get("content-length")||0);
+      if(!/^image\/(png|jpeg|webp|gif)$/.test(type)||!size||size>1024*1024)
+        return json({error:"Choose a PNG, JPEG, WebP or GIF up to 1 MB."},400);
+      await env.MUSIC.put("site/brand",req.body,{httpMetadata:{contentType:type}});
+      const v=Date.now();await DB.prepare("INSERT INTO settings(key,value) VALUES('brand_v',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(v)).run();
+      return json({ok:true,brand_v:v});
+    }
+    if(m === "DELETE") {
+      await env.MUSIC.delete("site/brand");
+      await DB.prepare("INSERT INTO settings(key,value) VALUES('brand_v','0') ON CONFLICT(key) DO UPDATE SET value='0'").run();
+      return json({ok:true,brand_v:0});
+    }
   }
   if (path === "/api/admin/favicon") {
     if (m === "PUT") {
@@ -1212,6 +2404,50 @@ async function api(req, env, url, ctx) {
       await DB.prepare("INSERT INTO settings (key, value) VALUES ('favicon_v', '0') ON CONFLICT(key) DO UPDATE SET value = '0'").run();
       return json({ ok: true, favicon: 0 });
     }
+  }
+  // Private administrator-only Spotify search settings. Never return a client
+  // secret, not even an encrypted copy. A blank secret in PUT means "keep".
+  if (path === "/api/admin/spotify-config") {
+    if (m === "GET") {
+      const saved = await spotifySavedConfig(env);
+      let locked = false;
+      if (saved) {
+        try { await decryptSpotifySecret(env, saved.secret_cipher); }
+        catch { locked = true; }
+      }
+      return json(spotifyConfigResponse(saved, env, locked));
+    }
+    if (m === "PUT") {
+      if (req.headers.get("content-type")?.split(";")[0] !== "application/json")
+        return json({ error: "JSON request required." }, 415);
+      if (Number(req.headers.get("content-length") || 0) > 4096) return json({ error: "Request too large." }, 413);
+      let b;
+      try { b = await req.json(); }
+      catch { return json({ error: "Invalid JSON." }, 400); }
+      const id = typeof b?.client_id === "string" ? b.client_id.trim() : "";
+      const supplied = typeof b?.client_secret === "string" ? b.client_secret.trim() : "";
+      if (!/^[a-zA-Z0-9_-]{8,128}$/.test(id)) return json({ error: "Enter a valid Spotify Client ID." }, 400);
+      if (supplied && (!/^[\x21-\x7e]{8,256}$/.test(supplied))) return json({ error: "Client secret must have 8–256 non-space characters." }, 400);
+      const saved = await spotifySavedConfig(env);
+      if (!supplied && !saved) return json({ error: "Enter the Spotify Client Secret." }, 400);
+      try {
+        const cipher = supplied ? await encryptSpotifySecret(env, supplied) : saved.secret_cipher;
+        // Verify the old secret is actually decryptable if it is retained.
+        if (!supplied) await decryptSpotifySecret(env, cipher);
+        await DB.prepare("INSERT INTO spotify_credentials(id,client_id,secret_cipher,updated_at) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET client_id=excluded.client_id, secret_cipher=excluded.secret_cipher, updated_at=excluded.updated_at")
+          .bind(id, cipher, Date.now()).run();
+        spotifyAuthCache = { id: "", token: "", expires: 0 };
+        return json({ ok: true, ...spotifyConfigResponse(await spotifySavedConfig(env), env) });
+      } catch (e) {
+        return json({ error: e instanceof Error ? e.message : "Unable to save encrypted Spotify settings." }, 503);
+      }
+    }
+    if (m === "DELETE") {
+      await DB.prepare("DELETE FROM spotify_credentials WHERE id = 1").run();
+      spotifyAuthCache = { id: "", token: "", expires: 0 };
+      return json({ ok: true, ...spotifyConfigResponse(null, env) });
+    }
+    return json({ error: "Method not allowed." }, 405);
   }
   if (path === "/api/admin/requests" && m === "GET") {
     const rows = (await DB.prepare("SELECT id, kind, title, artist, album, image, url, created_at, meta FROM requests WHERE status = 'active' ORDER BY created_at, rowid").all()).results;
@@ -1265,9 +2501,58 @@ async function api(req, env, url, ctx) {
       return json({ ok: true });
     }
   }
+  if(path==="/api/admin/hash-scan" && m==="POST") {
+    if(!env.SCANNER_SECRET)return json({error:"The SHA-256 folder scanner is available on Docker installations only."},400);
+    const request=crypto.randomUUID();
+    await DB.prepare("INSERT INTO settings(key,value) VALUES('hash_scan_request',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(request).run();
+    await DB.prepare("INSERT INTO settings(key,value) VALUES('fingerprint_status',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(JSON.stringify({state:"queued",total:0,scanned:0,changed:0,updated_at:Date.now()})).run();
+    return json({ok:true,request});
+  }
+  if(path==="/api/admin/duplicates" && m==="GET") {
+    const status=(await DB.prepare("SELECT value FROM settings WHERE key='fingerprint_status'").first())?.value;
+    // Exact-byte duplicates.  Upload objects and server-folder files are distinct
+    // storage sources; legacy upload hashes are not repeated on folder rows.
+    const cte=`WITH sources AS (
+      SELECT id,hash AS sha,size,'upload' AS source,'' AS source_path FROM tracks WHERE hash IS NOT NULL
+      UNION ALL
+      SELECT f.track_id AS id,f.sha256 AS sha,f.size AS size,'folder' AS source,f.source_path AS source_path FROM file_fingerprints f JOIN tracks t ON t.id=f.track_id
+    ), dup AS (SELECT sha,COUNT(*) AS qty FROM sources GROUP BY sha HAVING COUNT(*)>1)`;
+    const summary=await DB.prepare(cte+" SELECT COALESCE(SUM(qty-1),0) AS duplicates, COUNT(*) AS groups FROM dup").first();
+    const groups=(await DB.prepare(cte+" SELECT d.sha,d.qty,COALESCE(SUM(s.size),0) AS total_bytes FROM dup d JOIN sources s ON s.sha=d.sha GROUP BY d.sha,d.qty ORDER BY d.qty DESC,d.sha LIMIT 100").all()).results;
+    const entries=(await DB.prepare(cte+" SELECT s.id,s.sha,s.size,s.source,s.source_path,t.title,t.artist,t.plays, (SELECT COUNT(*) FROM playlist_tracks p WHERE p.track_id=s.id)+(SELECT COUNT(*) FROM user_playlist_tracks u WHERE u.track_id=s.id) AS references_count FROM sources s JOIN dup d ON s.sha=d.sha LEFT JOIN tracks t ON t.id=s.id ORDER BY s.sha,s.source DESC LIMIT 1000").all()).results;
+    return json({groups:groups.map(g=>({...g,items:entries.filter(e=>e.sha===g.sha)})),duplicate_count:summary?.duplicates||0,duplicate_groups:summary?.groups||0,status:status?JSON.parse(status):{state:"not_run"},note:"Only eligible, unused web-uploaded duplicates can be deleted. /music is mounted read-only."});
+  }
+  if((x=path.match(/^\/api\/admin\/duplicates\/([0-9a-f-]+)$/)) && m==="DELETE") {
+    const b=await req.json().catch(()=>({}));
+    if(b.confirm!=="delete duplicate")return json({error:"Explicit confirmation required."},400);
+    const track=await DB.prepare("SELECT id,hash,size,plays FROM tracks WHERE id=? AND hash IS NOT NULL").bind(x[1]).first();
+    if(!track)return json({error:"Only WASP-managed uploaded files can be deleted here. Original /music files stay read-only."},400);
+    const matches=await DB.prepare("SELECT (SELECT COUNT(*) FROM tracks WHERE hash=?)+(SELECT COUNT(*) FROM file_fingerprints WHERE sha256=?) AS n").bind(track.hash,track.hash).first();
+    if((matches?.n||0)<2)return json({error:"No other identical file is available. Refusing deletion."},409);
+    // A stale folder fingerprint is not sufficient to justify destroying the
+    // only uploaded copy. Require a recently confirmed folder scan if there
+    // are no other independently stored uploads with the same hash.
+    const alternative=await DB.prepare("SELECT COUNT(*) AS n FROM tracks WHERE hash=? AND id<>?").bind(track.hash,track.id).first();
+    if(!alternative?.n){
+      const marker=(await DB.prepare("SELECT value FROM settings WHERE key='fingerprint_status'").first())?.value;
+      let scan;try{scan=JSON.parse(marker||"{}");}catch{scan={};}
+      // Scans reconcile removed/moved paths before writing 'complete'. An old
+      // scan cannot justify deleting the only managed copy of a track.
+      if(scan.state!=="complete" || Date.now()-Number(scan.updated_at||0)>5*60*1000)
+        return json({error:"Complete a fresh SHA-256 scan of /music before deleting an upload that has no second uploaded copy."},409);
+      const surviving=await DB.prepare("SELECT COUNT(*) AS n FROM file_fingerprints WHERE sha256=?").bind(track.hash).first();
+      if(!surviving?.n)return json({error:"The matching /music file was removed or changed. Deletion refused."},409);
+    }
+    const refs=await DB.prepare("SELECT (SELECT COUNT(*) FROM playlist_tracks WHERE track_id=?)+(SELECT COUNT(*) FROM user_playlist_tracks WHERE track_id=?)+(SELECT COUNT(*) FROM reactions WHERE track_id=?)+(SELECT COUNT(*) FROM user_song_reactions WHERE track_id=?) AS n").bind(track.id,track.id,track.id,track.id).first();
+    if(refs.n || Number(track.plays)>0)return json({error:"This upload has plays, reactions or playlist references. Preserve it to avoid losing user data."},409);
+    await env.MUSIC.delete(track.id);
+    await DB.batch([DB.prepare("DELETE FROM track_artist_map WHERE track_id=?").bind(track.id),DB.prepare("DELETE FROM tracks WHERE id=? AND hash=?").bind(track.id,track.hash)]);
+    await touchCatalogue(DB);
+    return json({ok:true,deleted_id:track.id});
+  }
   if (path === "/api/admin/check" && m === "POST") {
     const b = await req.json().catch(() => ({}));
-    const row = /^[0-9a-f]{64}$/.test(b.hash) ? await DB.prepare("SELECT id FROM tracks WHERE hash = ?").bind(b.hash).first() : null;
+    const row = /^[0-9a-f]{64}$/.test(b.hash) ? (await DB.prepare("SELECT id FROM tracks WHERE hash = ?").bind(b.hash).first() || await DB.prepare("SELECT track_id AS id FROM file_fingerprints WHERE sha256=? LIMIT 1").bind(b.hash).first()) : null;
     return json({ id: row ? row.id : null });
   }
   if (path === "/api/admin/upload" && m === "POST") {
@@ -1280,7 +2565,7 @@ async function api(req, env, url, ctx) {
     if (!/\.mp3$/i.test(filename)) return json({ error: "Only .mp3 files are allowed." }, 400);
     const hash = req.headers.get("X-Hash") || "";
     if (!/^[0-9a-f]{64}$/.test(hash)) return json({ error: "Missing file fingerprint." }, 400);
-    const dup = await DB.prepare("SELECT id FROM tracks WHERE hash = ?").bind(hash).first();
+    const dup = await DB.prepare("SELECT id FROM tracks WHERE hash = ?").bind(hash).first() || await DB.prepare("SELECT track_id AS id FROM file_fingerprints WHERE sha256=? LIMIT 1").bind(hash).first();
     if (dup) return json({ error: "Already in the library.", id: dup.id }, 409);
     const pid = req.headers.get("X-Playlist");
     if (pid && !(await DB.prepare("SELECT 1 FROM playlists WHERE id = ?").bind(pid).first())) return json({ error: "Playlist not found." }, 400);
@@ -1300,8 +2585,18 @@ async function api(req, env, url, ctx) {
       "INSERT INTO tracks (id, title, artist, album, track_no, duration, size, created_at, hash, artists) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .bind(t.id, t.title, t.artist, t.album, t.track_no, t.duration, size, now, hash, JSON.stringify(t.artists))];
     if (pid) stmts.push(DB.prepare("INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, added_at) VALUES (?,?,?)").bind(pid, id, now));
+    stmts.push(...artistIndexStatements(DB,t));
     await DB.batch(stmts);
     await fulfil(env, t).catch(() => {}); // takes matching requests out of the queue
+    // Automatically warm biography and artwork for new artists/albums. Never
+    // fail an upload because a third-party artwork service is unavailable.
+    if(ctx?.waitUntil) ctx.waitUntil((async()=>{
+      for(const artist of (t.artists||[]).slice(0,3)) {
+        try { await serveBio(env,new URL("https://localhost/api/bio?name="+encodeURIComponent(artist)),null); } catch {}
+        try { await serveArt(env,new URL("https://localhost/art/artist?name="+encodeURIComponent(artist))); } catch {}
+        if(t.album) try { await serveArt(env,new URL("https://localhost/art/album?artist="+encodeURIComponent(artist)+"&album="+encodeURIComponent(t.album))); } catch {}
+      }
+    })());
     return json(t, 201);
   }
   if (path === "/api/admin/playlists" && m === "POST") {
@@ -1358,6 +2653,7 @@ async function api(req, env, url, ctx) {
       await env.MUSIC.delete([x[1], `art/track/${x[1]}`, `lyrics/${x[1]}`, `lyrics2/${x[1]}`]);
       await DB.batch([
         DB.prepare("DELETE FROM tracks WHERE id = ?").bind(x[1]),
+        DB.prepare("DELETE FROM track_artist_map WHERE track_id = ?").bind(x[1]),
         DB.prepare("DELETE FROM playlist_tracks WHERE track_id = ?").bind(x[1]),
         DB.prepare("DELETE FROM reactions WHERE track_id = ?").bind(x[1]),
       ]);
@@ -1366,8 +2662,11 @@ async function api(req, env, url, ctx) {
     if (m === "PATCH") {
       const b = await req.json().catch(() => ({}));
       const artists = artistsFromInput(b.artist);
-      await DB.prepare("UPDATE tracks SET title = ?, artist = ?, artists = ?, album = ? WHERE id = ?")
-        .bind(clean(b.title) || "Untitled", artists.join(", "), JSON.stringify(artists), clean(b.album), x[1]).run();
+      await DB.batch([
+        DB.prepare("UPDATE tracks SET title = ?, artist = ?, artists = ?, album = ? WHERE id = ?")
+          .bind(clean(b.title) || "Untitled", artists.join(", "), JSON.stringify(artists), clean(b.album), x[1]),
+        ...artistIndexStatements(DB,{id:x[1],artist:artists.join(", "),artists:JSON.stringify(artists),album:clean(b.album)})
+      ]);
       await env.MUSIC.delete([`lyrics/${x[1]}`, `lyrics2/${x[1]}`]);
       await fulfil(env, { title: clean(b.title), artists, album: clean(b.album) }).catch(() => {});
       return json({ ok: true });
@@ -1398,7 +2697,7 @@ async function api(req, env, url, ctx) {
     // partial schema upgrade never blocks the wipe.
     await DB.batch([
       DB.prepare("DELETE FROM playlist_tracks"), DB.prepare("DELETE FROM playlists"),
-      DB.prepare("DELETE FROM reactions"), DB.prepare("DELETE FROM tracks"), DB.prepare("DELETE FROM requests"),
+      DB.prepare("DELETE FROM reactions"), DB.prepare("DELETE FROM tracks"), DB.prepare("DELETE FROM track_artist_map"), DB.prepare("DELETE FROM requests"),
       DB.prepare("DELETE FROM artist_info"), DB.prepare("DELETE FROM artist_similar"),
     ]);
     try { await DB.prepare("DELETE FROM entity_reactions").run(); } catch {}
@@ -1408,6 +2707,8 @@ async function api(req, env, url, ctx) {
     const b = await req.json().catch(() => ({})), username = clean(b.username,32);
     if (!/^[a-zA-Z0-9_-]{3,32}$/.test(username)) return json({error:"Username must be 3–32 characters using letters, numbers, _ or -."},400);
     if (username.toLowerCase() === "admin") return json({error:"Choose a username other than admin."},400);
+    const current=await DB.prepare("SELECT salt,hash FROM admin WHERE id='admin'").first();
+    if(!current||!safeEq(await pbkdf2(String(b.password||''),current.salt),current.hash))return json({error:'Administrator password is incorrect.'},403);
     if (await DB.prepare("SELECT 1 FROM user_accounts WHERE username = ? COLLATE NOCASE").bind(username).first()) return json({error:"That username is already used by a member."},409);
     await DB.prepare("INSERT INTO settings (key,value) VALUES ('admin_username',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(username).run();
     return json({ok:true,username});
@@ -1433,7 +2734,8 @@ async function api(req, env, url, ctx) {
   if (path === "/api/admin/network" && m === "GET") {
     const share = await isSharing(DB);
     const peers = (await DB.prepare("SELECT id, url, name, track_count, last_ok, last_error, added_at FROM peers ORDER BY added_at").all()).results;
-    return json({ share, peers });
+    const primary=(await DB.prepare("SELECT value FROM settings WHERE key='primary_peer_id'").first())?.value||"";
+    return json({ share, primary_peer_id:primary, peers:peers.map(p=>({...p,is_primary:p.id===primary})) });
   }
   if (path === "/api/admin/network" && m === "PUT") {
     const b = await req.json().catch(() => ({}));
@@ -1441,6 +2743,14 @@ async function api(req, env, url, ctx) {
     await DB.prepare("INSERT INTO settings (key, value) VALUES ('network_share', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .bind(on ? "1" : "0").run();
     return json({ share: on });
+  }
+  if (path === "/api/admin/network/primary" && m === "PUT") {
+    const b=await req.json().catch(()=>({}));
+    const id=clean(b.peer_id,100);
+    if (id && !(await DB.prepare("SELECT id FROM peers WHERE id=?").bind(id).first())) return json({error:"Peer not found"},404);
+    await DB.prepare("INSERT INTO settings(key,value) VALUES('primary_peer_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(id).run();
+    await touchCatalogue(DB);
+    return json({ok:true,primary_peer_id:id});
   }
   if (path === "/api/admin/network/peers" && m === "POST") {
     const b = await req.json().catch(() => ({}));
@@ -1483,8 +2793,26 @@ async function api(req, env, url, ctx) {
     return json({ id, url: raw, name: peerInfo.name || raw, track_count: peerInfo.tracks || 0, online: true, last_ok: now }, 201);
   }
   if ((x = path.match(/^\/api\/admin\/network\/peers\/([\w-]+)$/)) && m === "DELETE") {
+    await DB.prepare("DELETE FROM peer_catalogue_chunks WHERE peer_id = ?").bind(x[1]).run();
+    await DB.prepare("DELETE FROM peer_catalogue_cache WHERE peer_id = ?").bind(x[1]).run();
     await DB.prepare("DELETE FROM peers WHERE id = ?").bind(x[1]).run();
+    await DB.prepare("UPDATE settings SET value='' WHERE key='primary_peer_id' AND value=?").bind(x[1]).run();
+    await touchCatalogue(DB);
     return json({ ok: true });
+  }
+  if ((x = path.match(/^\/api\/admin\/network\/peers\/([\w-]+)\/sync$/)) && m === "POST") {
+    const peer=await DB.prepare("SELECT id,url,name FROM peers WHERE id=?").bind(x[1]).first();
+    if(!peer)return json({error:"Peer not found"},404);
+    const body=await req.json().catch(()=>({}));
+    try {
+      if(body.phase==="finish"){
+        await snapshotPeerRevision(env,peer);
+        await touchCatalogue(DB);
+        return json({ok:true,phase:"finish",revision:await catalogueVersion(DB)});
+      }
+      const result=await syncPeerPhase(env,peer,body.phase);
+      return json({ok:true,...result});
+    }catch(e){return json({error:e.message||"Peer sync failed"},502);}
   }
   if ((x = path.match(/^\/api\/admin\/network\/peers\/([\w-]+)\/refresh$/)) && m === "POST") {
     const peer = await DB.prepare("SELECT * FROM peers WHERE id = ?").bind(x[1]).first();
@@ -1515,6 +2843,10 @@ async function api(req, env, url, ctx) {
 }
 
 export default {
+  async scheduled(controller,env,ctx) {
+    await init(env);
+    await runDueCronJobs(env,controller.scheduledTime||Date.now());
+  },
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
     if (env.DEEZER_API) DZ = env.DEEZER_API;
@@ -1524,10 +2856,18 @@ export default {
     if (env.SPOTIFY_URL) SPOTIFY = env.SPOTIFY_URL;
     if (env.LYRICSOVH_API) OVH = env.LYRICSOVH_API;
     try {
+      const hit=await cachedPublicResponse(req,url);
+      if(hit) return hit;
       await init(env);
       if (!env.DB || !env.MUSIC) {
         return json({ error: "This Worker has no D1 database (DB) or R2 bucket (MUSIC) bound. Enable R2 on the account, then check the Git build log and the Worker bindings." }, 503);
       }
+      // Isolated compatibility adapter: never interpret mobile URLs as native
+      // WASP routes. Its authentication and storage are independent.
+      if (url.pathname === '/mobile' || url.pathname === '/mobile/')
+        return env.ASSETS.fetch(new Request(new URL('/mobile.html',url),req));
+      if (/^\/(?:mobile\/)?rest\/[a-zA-Z][a-zA-Z0-9]*(?:\.view)?$/.test(url.pathname))
+        return await handleMobileRest(req,env,url);
       const share = await isSharing(env.DB);
       // Peer CORS preflight
       if (req.method === "OPTIONS" && share) {
@@ -1535,6 +2875,12 @@ export default {
         if (peerPaths) return new Response(null, { status: 204, headers: CORS_PEER });
       }
       if (url.pathname === "/site/favicon") return withCors(await serveFavicon(env), share);
+      if (url.pathname === "/site/brand") {
+        const obj=await env.MUSIC.get("site/brand");if(!obj)return new Response(null,{status:404});
+        const h=new Headers();obj.writeHttpMetadata(h);
+        h.set("cache-control","public, max-age=86400");h.set("x-content-type-options","nosniff");
+        return withCors(new Response(obj.body,{headers:h}),share);
+      }
       if(url.pathname.startsWith("/art/user-playlist/")){
         const id=url.pathname.slice("/art/user-playlist/".length);
         if(!/^[\w-]+$/.test(id))return new Response("Not found",{status:404});
@@ -1549,8 +2895,13 @@ export default {
       if (url.pathname.startsWith("/api/")) {
         const res = await api(req, env, url, ctx);
         // CORS only on public read endpoints (not admin)
-        const publicPeer = share && (url.pathname === "/api/tracks" || url.pathname === "/api/playlists" || url.pathname === "/api/user-playlists" || url.pathname === "/api/site" || url.pathname === "/api/peer" || url.pathname === "/api/network/peers");
-        return withCors(res, publicPeer);
+        const publicPeer = share && (url.pathname === "/api/tracks" || url.pathname === "/api/playlists" || url.pathname === "/api/user-playlists" || url.pathname === "/api/site" || url.pathname === "/api/peer" || url.pathname === "/api/network/peers" || url.pathname === "/api/catalog-version" || url.pathname === "/api/peer-plays" || url.pathname === "/api/recent-listens" || url.pathname === "/api/active-streams");
+        const output=withCors(res,publicPeer);
+        if(req.method !== "GET" && output.ok && changesCatalogue(url.pathname)) {
+          try { await touchCatalogue(env.DB); } catch(e) {console.warn("Unable to update catalogue revision",e.message);}
+        }
+        if(req.method !== "GET") invalidatePublicCache(req,url,output,ctx);
+        return await storePublicResponse(req,url,output,ctx);
       }
     } catch (e) {
       return json({ error: "Server error: " + e.message }, 500);
