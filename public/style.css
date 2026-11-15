@@ -300,6 +300,21 @@ body.up-open #lyrics.full{right:340px}
 .home-ad{margin-bottom:8px}
 .ib.ico svg{fill:currentColor;stroke:currentColor;stroke-width:1.6}
 
+/* WASP v13 polish */
+.brand-icon{width:27px;height:27px;object-fit:contain;border-radius:5px;flex:none}
+.side .brand{display:flex!important;align-items:center;gap:8px}
+.brand-icon-toggle{display:flex;align-items:center;gap:10px;padding:10px 0;color:var(--text);cursor:pointer}
+.brand-icon-toggle input{accent-color:var(--accent);width:17px;height:17px}
+.signin-required-dialog{max-width:min(400px,calc(100vw - 36px));width:100%;color:var(--text);background:var(--panel);border:1px solid var(--line2);border-radius:18px;padding:24px;box-shadow:0 20px 80px #000b}
+.signin-required-dialog h2{font-size:22px;margin:0 0 10px}
+.signin-required-dialog p{line-height:1.6;margin:0 0 22px}
+.signin-required-dialog .form{gap:8px}
+.signin-required-dialog::backdrop{background:#000a}
+.reqform #rqGo{margin-top:22px}
+.users-summary{overflow-x:auto}
+.users-summary table{min-width:660px}
+.users-summary th{text-align:left;white-space:nowrap;color:var(--muted)}
+.users-summary td{padding:13px 10px}
 /* RiffVault navigation and playlist controls */
 .home-row-head{display:flex;align-items:center;justify-content:space-between;gap:1rem}.home-row-head h2{margin:0}.hnav{border:1px solid #7775;border-radius:50%;background:transparent;color:inherit;font-size:1.6rem;cursor:pointer;width:36px;height:36px}.hrow{overflow-x:auto;scrollbar-width:none;scroll-behavior:smooth}.hrow::-webkit-scrollbar{display:none}.album-add{margin-left:auto;border:1px solid #7776;border-radius:50%;background:transparent;color:inherit;cursor:pointer;font-size:1.3rem}.user-tabs{margin-bottom:1rem}#playlistDialog{max-width:95vw;color:inherit;background:#202126;border:1px solid #7777;border-radius:12px;padding:1.5rem}#playlistDialog select{padding:.7rem;background:#303139;color:white;border-radius:6px}
 
@@ -357,7 +372,7 @@ body.up-open #lyrics.full{right:340px}
 .admin-account-pill:hover{background:var(--accent);color:#111}
 
 /* Playlist artwork and dedicated editor modal */
-.playlist-album-collage{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));grid-template-rows:repeat(9,minmax(0,1fr));height:100%;width:100%;overflow:hidden;background:var(--panel)}
+.playlist-album-collage{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));height:100%;width:100%;overflow:hidden;background:var(--panel)}
 .playlist-album-collage img{display:block;width:100%;height:100%;min-width:0;min-height:0;object-fit:cover}
 .owned-cover-image,.owned-cover-fallback{display:block;width:100%;height:100%}
 .owned-cover-image[hidden],.owned-cover-fallback[hidden]{display:none!important}
@@ -387,3 +402,275 @@ body.up-open #lyrics.full{right:340px}
 .playlist-upload-label input{box-sizing:border-box;max-width:100%;width:100%;padding:11px;border:1px dashed var(--line2);border-radius:10px;background:var(--bg);color:var(--text)}
 .playlist-edit-modal-content .playlist-edit-actions{justify-content:flex-end;margin-top:3px}
 .playlist-edit-modal-content .msg{min-height:0;margin:0}
+
+/* Playlist artwork: exactly nine album-art tiles, like the public playlist cards. */
+.playlist-album-collage{aspect-ratio:1;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));border-radius:inherit}
+.playlist-detail-cover .playlist-album-collage,.playlist-edit-preview .playlist-album-collage{width:100%;height:100%}
+.playlist-delete-zone{border-top:1px solid var(--line2);padding-top:18px;margin-top:6px}
+.playlist-delete-zone p{margin:0 0 10px}
+.owned-track-line{display:flex;align-items:center;position:relative;gap:4px;min-width:0;border-radius:9px}
+.owned-track-line:nth-child(odd){background:rgba(255,255,255,.018)}
+.owned-track-line:hover{background:var(--panel)}
+.owned-track-line>.row{flex:1;min-width:0}
+.owned-remove{flex:none;width:38px;height:38px;border-radius:50%;background:transparent;border:1px solid transparent;color:var(--muted);font-size:23px;cursor:pointer;margin:0 8px 0 0;display:grid;place-items:center}
+.owned-remove:hover,.owned-remove:focus-visible{border-color:var(--danger);color:var(--danger);background:rgba(255,138,122,.1)}
+.owned-missing-track{padding:17px 12px;flex:1}
+.playlist-draft-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap;padding:12px 0 14px;position:sticky;top:105px;z-index:4;background:var(--bg)}
+.playlist-draft-toolbar[hidden]{display:none!important}
+.playlist-draft-toolbar .btn{min-height:40px}
+.playlist-draft-toolbar button:disabled{opacity:.45;cursor:not-allowed}
+.playlist-draft-toolbar .muted{margin-right:auto}
+.playlist-copy-form{display:flex;flex-direction:column;gap:17px;min-width:0;padding:27px;max-height:min(85dvh,700px);overflow:auto}
+.playlist-copy-form h2{margin:0}
+.playlist-copy-form .playlist-copy-option{display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:700}
+.playlist-copy-form input[type=radio]{accent-color:var(--accent);width:17px;height:17px}
+.playlist-copy-field{display:flex;flex-direction:column;gap:7px;font-size:14px;font-weight:650;min-width:0}
+.playlist-copy-field input,.playlist-copy-field select{min-height:45px;padding:10px 13px;border:1px solid var(--line2);background:var(--bg);color:var(--text);border-radius:9px;min-width:0;width:100%}
+.playlist-copy-field[hidden]{display:none!important}
+.playlist-copy-form .msg{margin:0;min-height:0}
+@media (max-width:640px){.owned-track-line>.row{grid-template-columns:30px minmax(0,1fr) 42px}.owned-remove{margin-right:0;width:32px;height:32px}.playlist-copy-form{padding:20px}}
+
+/* Undo/Save occupy the space beside the playlist artwork, not permanent form rows. */
+.owned-playlist-header{width:100%;max-width:100%;}
+.owned-playlist-header .playlist-draft-toolbar{position:absolute;top:196px;left:calc(min(250px,60vw) + 14px);width:max-content;max-width:calc(100% - min(250px,60vw) - 14px);background:transparent;padding:0;justify-content:flex-start;gap:9px}
+.owned-playlist-header .playlist-draft-toolbar .muted{order:3;flex-basis:100%;margin-left:3px}
+.owned-remove{margin:0 0 0 6px}
+@media(max-width:760px){.owned-playlist-header .playlist-draft-toolbar{position:static;left:auto;top:auto;margin:8px 0 20px;max-width:100%}.owned-playlist-header .playlist-draft-toolbar .muted{flex-basis:auto}}
+
+.owned-playlist-header .playlist-cog{left:calc(min(250px,60vw) + 12px);right:auto;top:8px}
+.album-grid-tile{position:relative;display:block;min-width:0;min-height:0;overflow:hidden;background:linear-gradient(135deg,#44403b,#25211c);font-style:normal}
+.album-grid-tile::before{content:attr(data-letter);position:absolute;inset:0;display:grid;place-items:center;color:#d3d3c7;font-size:clamp(8px,1.5vw,18px);font-weight:750}
+.playlist-album-collage .album-grid-tile img{position:relative;z-index:1;width:100%;height:100%;object-fit:cover}
+
+/* Peer and user playlist cards must reserve the cover even when artwork fails.
+   Keeping the hover region also exposes Play for remote playlists. */
+.pltile .covwrap{width:100%;aspect-ratio:1;position:relative}
+.pltile .covlink{width:100%;height:100%;overflow:hidden;display:block;border-radius:10px}
+.pltile .covlink>.owned-cover-image,.pltile .covlink>.owned-cover-fallback,
+.pltile .covlink>.playlist-album-collage,.pltile .covlink>.playlist-cover-empty{width:100%;height:100%;border-radius:inherit}
+.pltile .covlink .playlist-cover{display:block;width:100%;height:100%;object-fit:cover}
+.pltile:hover .fab,.pltile:focus-within .fab{opacity:1;transform:none}
+.pltile .fab:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+
+/* WASP v13: Spotify playlist search and signed-out account label */
+.account-menu #gear .whoami{white-space:nowrap;font-weight:600;font-size:14px}
+.spotify-search-block{display:flex;flex-direction:column;gap:8px;margin:18px 0 20px;max-width:640px}
+.spotify-search-block input{width:100%;border-radius:999px}
+.spotify-search-block #spotifySearchHelp{font-size:13px;margin:0}
+.spotify-results{display:grid;gap:4px;min-width:0;max-height:270px;overflow-y:auto}
+.spotify-result{background:transparent;color:var(--text);border:1px solid var(--line2);border-radius:10px;display:flex;gap:12px;align-items:center;text-align:left;padding:10px;cursor:pointer;width:100%;min-width:0}
+.spotify-result:hover,.spotify-result:focus-visible{background:var(--panel);border-color:var(--accent)}
+.spotify-result .t{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis}
+.spotify-result small{display:block;color:var(--muted);font-weight:400;margin-top:4px}
+.spotify-error{line-height:1.5}
+
+/* Admin Requests → Spotify settings (WASP dark theme) */
+.spotify-config-form{display:flex;flex-direction:column;align-items:stretch;gap:9px;max-width:540px;margin-top:20px}
+.spotify-config-form label{font-weight:600;font-size:14px}
+.spotify-config-form input{width:100%;max-width:540px}
+.spotify-config-form .muted{margin:0 0 9px}
+.spotify-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.spotify-config-form .msg{min-height:0;margin:0}
+.spotify-config-footnote{margin:24px 0 0;max-width:680px;line-height:1.6}
+#reqSpotifyPanel>.card{max-width:780px}
+
+/* WASP v13: unified playlist heart, like and dislike controls. */
+.playlist-detail-actions{align-items:center}
+.playlist-ratings{margin-left:0;gap:12px;flex-wrap:wrap}
+.playlist-ratings .rc{gap:6px}
+.playlist-ratings .playlist-heart{min-height:44px;white-space:nowrap}
+.playlist-ratings .playlist-heart.on{color:var(--accent);border-color:var(--accent)}
+.playlist-ratings small{min-width:1ch}
+
+/* WASP v14.0.2 admin network schedules and build identifier */
+#panel .side{display:flex;flex-direction:column;min-height:100vh}
+.admin-build{margin-top:auto;padding:12px 14px 6px;border-top:1px solid var(--line);color:var(--muted);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.cron-job legend{font-weight:650;padding:0 8px}
+.cron-job input[type=checkbox]{accent-color:var(--accent);width:18px;height:18px;vertical-align:middle}
+.cron-fields{display:flex;align-items:flex-end;gap:18px;flex-wrap:wrap}
+.cron-fields label{display:flex;flex-direction:column;gap:7px;color:var(--muted);font-size:13px}
+.cron-fields input,.cron-fields select,#cronTimezone{height:44px;border:1px solid var(--line2);border-radius:20px;background:var(--panel);color:var(--text);padding:0 15px;max-width:100%}
+.cron-fields.cron-disabled{opacity:.5}
+#cronTimezone{display:block;margin:8px 0 10px;min-width:240px}
+@media(max-width:860px){#panel .side{min-height:0}.admin-build{margin-top:18px}}
+
+/* WASP v15.0.2: natural-height BBCode credits anchored to the sidebar bottom. */
+.brand .brand-image{display:block;max-height:52px;max-width:180px;width:auto;height:auto;object-fit:contain}
+.app>.side{display:flex;flex-direction:column}
+.app>.side #nav{flex:0 0 auto}
+.sidebar-credits{margin-top:auto;flex:0 0 auto;padding:12px 14px 0;border-top:1px solid var(--line);max-width:100%}
+.sidebar-credits-content{font-size:11px;line-height:1.55;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}
+.sidebar-credits-content a{color:var(--muted);text-decoration:none}
+.sidebar-credits-content a:hover{color:var(--accent);text-decoration:underline}
+.sidebar-credits-content img{display:inline-block;width:auto;height:auto;max-width:100%;max-height:80px;object-fit:contain;vertical-align:middle}
+.sidebar-credits-content .bb-center{display:block;text-align:center}
+.sidebar-credits-preview{margin:6px 0 18px;min-height:38px;max-width:240px;padding:10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg)}
+.sidebar-help{line-height:1.8}
+.sidebar-help code{font-size:12px}
+@media(max-width:760px){.sidebar-credits{margin-top:12px}}
+.markdown-view{line-height:1.65;max-width:960px;overflow-wrap:anywhere}
+.markdown-view h1,.markdown-view h2,.markdown-view h3{padding-bottom:10px;border-bottom:1px solid var(--line2)}
+.markdown-view pre{overflow-x:auto;padding:16px;border-radius:10px;background:#100f0e;border:1px solid var(--line2)}
+.markdown-view code{background:#100f0e;border-radius:4px;padding:2px 4px}
+.markdown-view pre code{padding:0}
+.markdown-view blockquote{padding-left:14px;border-left:3px solid var(--line2);color:var(--muted)}
+.markdown-view table{display:block;overflow-x:auto}
+
+
+/* WASP v15.0.4 — desktop collapsible sidebar / icon navigation. */
+.side-nav-controls{display:flex;justify-content:flex-end;margin:-8px 0 4px;min-height:34px}
+.sidebar-toggle{width:34px;height:34px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--muted);cursor:pointer;display:grid;place-items:center;padding:6px}
+.sidebar-toggle:hover,.sidebar-toggle:focus-visible{background:var(--panel);border-color:var(--line2);color:var(--accent)}
+.sidebar-toggle svg{width:19px;height:19px;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.sidebar-toggle .side-expand-icon{display:none}
+.nav-icon-frame{display:none}
+.side .mini-brand-icon{display:none}
+.sidebar-hover-tip{position:fixed;z-index:90;pointer-events:none;max-width:220px;padding:6px 10px;border-radius:7px;border:1px solid var(--line2);background:#272522;box-shadow:0 8px 22px #0009;color:var(--text);font-size:12px;font-weight:650;white-space:nowrap}
+.sidebar-hover-tip[hidden]{display:none}
+@media(min-width:761px){
+  .app{transition:grid-template-columns .18s ease}
+  body.sidebar-collapsed .app{grid-template-columns:76px minmax(0,1fr)}
+  body.sidebar-collapsed .app>.side{padding:18px 8px}
+  body.sidebar-collapsed .side .brand{padding:0 0 14px;text-align:center;font-size:0;min-height:42px;display:flex;align-items:center;justify-content:center}
+  body.sidebar-collapsed .side .brand>*:not(.mini-brand-icon){display:none}
+  body.sidebar-collapsed .side .mini-brand-icon{display:block;width:36px;height:36px;object-fit:contain}
+  body.sidebar-collapsed .side-nav-controls{justify-content:center;margin:-4px 0 10px}
+  body.sidebar-collapsed .sidebar-toggle .side-collapse-icon{display:none}
+  body.sidebar-collapsed .sidebar-toggle .side-expand-icon{display:block}
+  body.sidebar-collapsed .side .nav-label{display:none}
+  body.sidebar-collapsed #nav{display:flex;flex-direction:column;gap:6px}
+  body.sidebar-collapsed .side .nav-item{width:100%;height:52px;min-height:52px;padding:3px;display:flex;align-items:center;justify-content:center;border-radius:12px}
+  body.sidebar-collapsed .side .nav-item[aria-current=page]{box-shadow:none;background:var(--panel)}
+  body.sidebar-collapsed .side .nav-item[aria-current=page] .nav-icon-frame{border-color:var(--accent);background:#343b2c}
+  body.sidebar-collapsed .nav-icon-frame{display:grid;place-items:center;width:46px;height:46px;border:1px solid var(--line2);border-radius:12px;background:#242320;transition:background .15s,border-color .15s}
+  body.sidebar-collapsed .nav-item:hover .nav-icon-frame{background:#38362f;border-color:var(--accent)}
+  body.sidebar-collapsed .nav-icon{display:block;width:27px;height:27px;object-fit:contain;filter:brightness(0) invert(.87)}
+  body.sidebar-collapsed .nav-icon.nav-icon-color{filter:none}
+  body.sidebar-collapsed #sidebarCredits{display:none!important}
+}
+@media(max-width:760px){
+  .side-nav-controls{display:none}
+  .sidebar-hover-tip{display:none!important}
+}
+@media(prefers-reduced-motion:reduce){.app{transition:none!important}.nav-icon-frame{transition:none!important}}
+
+/* WASP v15.0.5 — account and community peer publishing */
+.table-scroll{max-width:100%;overflow-x:auto}
+.users-summary .table-scroll table{min-width:1000px;width:100%}
+.users-summary [data-delete-user]{white-space:nowrap;min-height:34px;padding:5px 10px}
+.users-summary label.check{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.account-name-form{display:flex;flex-direction:column;align-items:stretch;gap:10px;margin:12px 0 20px}
+.account-name-form label{display:flex;flex-direction:column;gap:6px}
+.published-peer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 4px;border-bottom:1px solid var(--line)}
+.published-peer-row p{margin:5px 0;font-size:12px;overflow-wrap:anywhere}
+#publishLinkForm{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
+#publishLinkForm input{flex:1;min-width:180px}
+@media(max-width:600px){.published-peer-row{align-items:flex-start}.account-name-form{max-width:100%}}
+
+/* WASP v15.0.6 — searchable users, publish requests, and account notifications */
+.users-summary .table-scroll table{min-width:1430px;width:100%;border-collapse:collapse}
+.users-summary .table-scroll th{white-space:nowrap;padding:6px 7px}
+.users-summary .table-scroll td{padding:14px 7px}
+.users-sort{font:inherit;font-weight:700;color:var(--muted);background:transparent;border:0;cursor:pointer;padding:8px 0;white-space:nowrap;text-align:left}
+.users-sort:hover,.users-sort:focus-visible{color:var(--accent)}
+.users-sort-indicator{font-size:10px;opacity:.65;margin-left:4px}
+.users-summary th[aria-sort=ascending] .users-sort,.users-summary th[aria-sort=descending] .users-sort{color:var(--accent)}
+#usersSearch{display:block;max-width:420px;width:100%;margin:8px 0 12px}
+.publish-global-label{display:flex!important;align-items:center;gap:10px;margin:18px 0 6px;font-weight:650}
+.publish-global-label input{width:18px;height:18px;accent-color:var(--accent)}
+.publish-global-note{margin:4px 0 14px}
+.users-name{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.publish-request-dot,.nav-notice-dot,.publish-subtab-dot{display:inline-block;flex:none;width:11px;height:11px;border-radius:50%;background:#f33440;box-shadow:0 0 0 2px #0d0d0d}
+.nav-has-notices{position:relative;justify-content:space-between}
+.publish-request-count{margin-left:auto;min-width:19px;height:19px;border-radius:999px;line-height:19px;text-align:center;padding:0 4px;background:#ed2635;color:#fff;font-size:11px;font-weight:800}
+.publish-request-count[hidden]{display:none}
+.nav-notice-dot.notice-expanded{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:10px;height:10px}
+.nav-notice-dot.notice-compact{display:none}
+body.sidebar-collapsed .nav-notice-dot.notice-expanded{display:none}
+body.sidebar-collapsed .nav-icon-frame{position:relative}
+body.sidebar-collapsed .nav-notice-dot.notice-compact{display:block;position:absolute;right:1px;top:1px;width:12px;height:12px}
+#subbar a[href="#settings/publish"]{position:relative}
+.publish-subtab-dot{position:absolute;right:-4px;top:-4px;width:10px;height:10px}
+.publish-pending{color:var(--accent);font-size:13px;font-weight:600}
+#requestPublish{margin-top:12px}
+/* The username fields should match existing dark, oval password fields. */
+#adminNewName,#changeUsernameForm input[name=username]{box-sizing:border-box;height:48px;width:100%;max-width:100%;padding:0 20px;border-radius:999px;border:1px solid var(--line2);background:var(--panel);color:var(--text);font:inherit}
+.account-name-form input{box-sizing:border-box;width:100%;max-width:100%}
+@media(max-width:760px){.users-summary .table-scroll table{min-width:1360px}}
+
+/* v15.0.7: recent plays timeline with relative time and live indicator. */
+.recent-listen-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 9px;min-height:25px;margin-top:1px}
+.tile .recent-listen-meta .muted{font-size:11px;white-space:nowrap}
+.recent-played-at{font-variant-numeric:tabular-nums}
+.recent-streaming{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;flex:0 0 26px;vertical-align:middle}
+.recent-streaming img{display:block;width:100%;height:100%;object-fit:contain;animation:wasp-live-pulse 1.7s ease-in-out infinite}
+@keyframes wasp-live-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.65;transform:scale(.9)}}
+@media (prefers-reduced-motion:reduce){.recent-streaming img{animation:none}}
+
+
+/* WASP v15.0.8 — native, HTML-backed account settings modal.
+   Never unmount or obscure the underlying music player's state. */
+.account-settings-dialog{box-sizing:border-box;width:min(700px,calc(100vw - 28px));max-width:calc(100vw - 28px);max-height:min(810px,calc(100dvh - 30px));overflow:hidden;padding:0;border:1px solid var(--line2);border-radius:20px;background:var(--panel);color:var(--text);box-shadow:0 28px 90px #000c}
+.account-settings-dialog::backdrop{background:rgba(0,0,0,.68);backdrop-filter:blur(3px)}
+.account-settings-dialog #accountSettingsMount{min-height:140px;max-height:calc(100dvh - 32px);display:flex;flex-direction:column;overflow:hidden}
+.settings-modal-shell{display:flex;flex-direction:column;min-height:0;max-height:inherit}
+.settings-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:24px 28px 15px;border-bottom:1px solid var(--line)}
+.settings-modal-head h2{font-size:clamp(20px,3.5vw,26px);margin:0 0 6px}
+.settings-modal-kicker{font-size:11px;font-weight:800;letter-spacing:.15em;color:var(--accent);margin:0 0 5px}
+.settings-modal-description{margin:0;color:var(--muted);font-size:13px}
+.settings-modal-close{display:grid;place-items:center;flex:none;width:38px;height:38px;font-size:26px;line-height:1;border:1px solid var(--line2);border-radius:12px;background:var(--bg);color:var(--text);cursor:pointer}
+.settings-modal-close:hover{color:var(--accent);border-color:var(--accent)}
+.settings-modal-tabs{display:flex;gap:9px;padding:14px 28px 10px;border-bottom:1px solid var(--line)}
+.settings-modal-tabs [data-settings-tab]{position:relative;min-height:40px;padding:0 19px;border-radius:24px;background:transparent;border:1px solid var(--line2);color:var(--muted);font-weight:700;cursor:pointer}
+.settings-modal-tabs [data-settings-tab][aria-selected="true"]{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.settings-modal-tabs [data-settings-tab]:hover:not([aria-selected="true"]){color:var(--text);border-color:var(--muted)}
+.settings-modal-body{min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px 28px 26px;scrollbar-gutter:stable}
+.settings-modal-body .settings-panel{max-width:none;padding:8px 0}
+.settings-modal-body .settings-panel h3{margin:20px 0 8px;font-size:17px}
+.settings-modal-body .settings-panel h3:first-child{margin-top:8px}
+.settings-modal-body .settings-signed-in{margin:4px 0 18px;color:var(--muted);font-size:14px}
+.settings-modal-body .settings-signed-in strong{color:var(--text)}
+.settings-modal-body .password-form{align-items:stretch;gap:12px;margin:12px 0 24px;padding:16px 18px;border:1px solid var(--line2);border-radius:14px;background:var(--bg)}
+.settings-modal-body .password-form label{width:100%;font-size:13px;font-weight:650}
+.settings-modal-body .password-form input{width:100%;max-width:100%;min-width:0;border-radius:999px}
+.settings-modal-body .password-form .btn{align-self:flex-start}
+.settings-modal-body .password-form .msg{margin:0}
+.settings-modal-body .published-peer-row{gap:10px;flex-wrap:wrap}
+.settings-modal-body .published-peer-row .btn{min-height:38px}
+.account-admin-link{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px}
+.settings-modal-loading{padding:24px}
+@media(max-width:600px){.account-settings-dialog{width:calc(100vw - 16px);max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border-radius:15px}.account-settings-dialog #accountSettingsMount{max-height:calc(100dvh - 18px)}.settings-modal-head{padding:17px 18px 12px}.settings-modal-tabs{padding:12px 18px 10px}.settings-modal-body{padding:7px 18px 22px}.settings-modal-body .password-form{padding:14px}.settings-modal-description{font-size:12px}}
+@media(prefers-reduced-motion:reduce){.account-settings-dialog::backdrop{backdrop-filter:none}}
+
+
+/* WASP v15.0.9 — single-row active-stream preview + 30 newest live songs. */
+.listened-tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:14px 0 16px}
+.listened-tabs a{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:0 18px;
+ border:1px solid var(--line2);border-radius:999px;color:var(--text);text-decoration:none;font-size:13px;font-weight:700}
+.listened-tabs a[aria-current=page]{background:var(--accent);border-color:var(--accent);color:#151515}
+.live-preview,.live-full{padding:18px 20px;border-radius:16px;border:1px solid var(--line2);background:var(--panel)}
+.live-section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.live-section-heading h2{margin:0 0 5px;font-size:22px;line-height:1.2}
+.live-section-heading p{margin:0;font-size:12px}
+.live-stats{display:flex;align-items:center;gap:9px;margin-left:auto}
+.live-badge,.live-listeners{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;font-weight:800;white-space:nowrap}
+.live-badge{min-height:26px;padding:0 12px;background:#075b28;color:#25f67b;font-size:12px}
+.live-listeners{min-height:28px;gap:7px;padding:0 12px;background:#d7192b;color:#fff;font-size:15px;font-variant-numeric:tabular-nums}
+.live-listeners svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:2.3;stroke-linecap:round;stroke-linejoin:round}
+.live-preview-grid{display:grid;grid-template-columns:repeat(var(--live-cols),minmax(0,1fr));gap:12px;align-items:start}
+.live-preview .tile,.live-full .tile{padding:8px;min-width:0}
+.live-preview .tile .art,.live-full .tile .art{border-radius:9px}
+.live-preview .tile b,.live-full .tile b{margin-top:8px}
+.live-track-status{display:flex;align-items:center;gap:5px;margin-top:4px;color:#19df74;font-size:12px;font-weight:700}
+.live-track-status img{width:18px;height:18px;object-fit:contain;animation:wasp-live-pulse 1.7s ease-in-out infinite}
+.live-track .muted{font-size:12px}
+.live-more-tile{display:flex;align-items:center;flex-direction:column;justify-content:center;min-width:0;height:100%;padding:8px 3px;
+ gap:10px;text-align:center;color:var(--text);text-decoration:none;font-size:12px}
+.live-more-circle{display:grid;place-items:center;width:min(100%,140px);aspect-ratio:1;border-radius:50%;background:#383633;color:#b9b9b9;font-size:24px;letter-spacing:3px}
+.live-more-tile:hover .live-more-circle{background:#484641;color:#fff}
+.live-more-tile b{font-size:12px;line-height:1.3}
+.live-empty{padding:18px 0 6px;margin:0}
+.recent-list-divider{height:1px;background:var(--line2);margin:20px 0 18px}
+.live-all-grid{gap:14px 10px}
+@media(max-width:760px){.live-preview,.live-full{padding:12px}.live-section-heading h2{font-size:19px}.live-preview-grid{gap:6px}.live-preview .tile,.live-full .tile{padding:4px}}
+@media(prefers-reduced-motion:reduce){.live-track-status img{animation:none}}

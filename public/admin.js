@@ -1,4 +1,5 @@
 import { readTags } from "/id3.js";
+import { renderSidebarBBCode, legacySidebarToBBCode } from "/sidebar-bbcode.js";
 import { artistArt, albumArt, albumName, artistsOf, artistLine, adDoc, AD_SANDBOX } from "/art.js";
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -17,21 +18,164 @@ const mini = (src, label) => `<span class="art" data-i="${esc((label || "?").tri
 document.addEventListener("error", (e) => { if (e.target.tagName === "IMG") e.target.remove(); }, true);
 
 // ---------- sections (left menu) ----------
-const PANES = { collection: "Music collection", add: "Add music", playlists: "Playlists", requests: "Requests", settings: "General settings", account: "Account settings", network: "Network", danger: "Danger" };
+const PANES = { collection: "Music collection", duplicates: "Duplicate management", add: "Add music", playlists: "Playlists", requests: "Requests", settings: "General settings", account: "Account settings", network: "Network", danger: "Danger", users: "Users", docs: "Update documentations" };
 function showPane() {
-  const k = has(PANES, location.hash.slice(1)) ? location.hash.slice(1) : "collection";
-  $("#anav").innerHTML = Object.entries(PANES).map(([id, label]) =>
+  const route = location.hash.slice(1);
+  const section = route.split("/")[0];
+  const k = has(PANES, section) ? section : "collection";
+  $("#anav").innerHTML = Object.entries(PANES).filter(([id])=>id!=="docs").map(([id, label]) =>
     `<a class="nav-item${id === "danger" ? " dng" : ""}" href="#${id}"${id === k ? ' aria-current="page"' : ""}>${label}</a>`).join("");
+  adminPublishNotificationBadge(pendingPublishCount);
   document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("hidden", p.id !== "s-" + k));
+  if (k === "duplicates") loadDuplicates();
+  if (k === "users") loadUsers();
+  $("#docsNav").setAttribute("aria-current",k==="docs"?"page":"false");
+  if (k === "docs") loadDocs();
+  if (k === "requests") showRequestTab(route === "requests/spotify");
+  if (k === "network") showNetworkTab(route === "network/crons");
+  pollAdminPublishRequests();
   window.scrollTo(0, 0);
 }
 window.addEventListener("hashchange", showPane);
+// Community publishing: global default, per-account exceptions, searchable/sortable statistics.
+let registeredUsers = [], usersSortKey = '', usersSortDescending = false, pendingPublishCount=0;
+const USER_COLUMNS = [
+  ['username','Username','text'],['heart_songs','Heart songs','number'],
+  ['like_songs','Like songs','number'],['dislike_songs','Dislike songs','number'],
+  ['private_playlists','Private playlists','number'],['public_playlists','Published playlists','number'],
+  ['provided_links','Provided links','number'],['online_links','Online links','number'],
+  ['created_at','Registered date','date'],['can_publish','Can publish','number'],
+];
+function adminPublishNotificationBadge(count){
+  pendingPublishCount=Math.max(0,Number(count)||0);
+  const nav=document.querySelector('#anav a[href="#users"]');
+  if(!nav)return;
+  nav.classList.add('nav-has-notices');
+  let badge=nav.querySelector('.publish-request-count');
+  if(!badge){badge=document.createElement('span');badge.className='publish-request-count';nav.appendChild(badge);}
+  badge.textContent=pendingPublishCount>99?'99+':String(pendingPublishCount);
+  badge.hidden=pendingPublishCount===0;
+  nav.setAttribute('aria-label',pendingPublishCount?`Users · ${pendingPublishCount} pending publish request${pendingPublishCount===1?'':'s'}`:'Users');
+}
+async function pollAdminPublishRequests(){
+  if($('#panel').classList.contains('hidden'))return;
+  try{const r=await fetch('/api/admin/users/publish-notifications',{cache:'no-store'});if(!r.ok)return;
+    const data=await r.json();const before=pendingPublishCount;
+    adminPublishNotificationBadge(data.pending);
+    if(before!==pendingPublishCount && location.hash.split('/')[0]==='#users')await loadUsers();
+  }catch{}
+}
+function renderUsersTable(){
+  const el=$('#usersList');
+  const search=$('#usersSearch').value.trim().toLocaleLowerCase();
+  let rows=registeredUsers.filter(u=>String(u.username||'').toLocaleLowerCase().includes(search));
+  if(usersSortKey){
+    const column=USER_COLUMNS.find(c=>c[0]===usersSortKey);
+    rows=[...rows].sort((a,b)=>{
+      const av=a[usersSortKey],bv=b[usersSortKey];let difference;
+      if(column?.[2]==='text')difference=String(av||'').localeCompare(String(bv||''),undefined,{sensitivity:'base',numeric:true});
+      else difference=(Number(av)||0)-(Number(bv)||0);
+      if(!difference)difference=String(a.username||'').localeCompare(String(b.username||''),undefined,{sensitivity:'base'});
+      return usersSortDescending?-difference:difference;
+    });
+  }
+  const heading=USER_COLUMNS.map(([key,title])=>{
+    const active=usersSortKey===key;
+    return `<th scope="col" aria-sort="${active?(usersSortDescending?'descending':'ascending'):'none'}"><button type="button" class="users-sort" data-sort="${key}" aria-label="Sort by ${title}">${title}<span class="users-sort-indicator" aria-hidden="true">${active?(usersSortDescending?' ▼':' ▲'):' ↕'}</span></button></th>`;
+  }).join('')+'<th scope="col">Actions</th>';
+  const content=rows.map(u=>{
+    const date=Number(u.created_at)?new Date(Number(u.created_at)).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}):'—';
+    const requested=!!u.publish_requested;
+    const cell=USER_COLUMNS.map(([key])=>{
+      if(key==='username')return `<td><span class="users-name">${requested?'<span class="publish-request-dot" aria-label="Publishing permission requested" title="Request to publish pending"></span>':''}<b>${esc(u.username)}</b></span></td>`;
+      if(key==='can_publish')return `<td><label class="check"><input type="checkbox" data-user-publish="${esc(u.id)}" ${u.can_publish?'checked':''} aria-label="Allow ${esc(u.username)} to publish WASP links"> Allow</label></td>`;
+      if(key==='created_at')return `<td><time datetime="${Number(u.created_at)?new Date(Number(u.created_at)).toISOString():''}">${esc(date)}</time></td>`;
+      return `<td>${Number(u[key])||0}</td>`;
+    }).join('');
+    return `<tr data-user-id="${esc(u.id)}">${cell}<td><button class="btn danger" type="button" data-delete-user="${esc(u.id)}" data-delete-name="${esc(u.username)}">Delete user</button></td></tr>`;
+  }).join('');
+  el.innerHTML=registeredUsers.length?`<div class="table-scroll"><table><thead><tr>${heading}</tr></thead><tbody>${content||`<tr><td colspan="11" class="muted">No usernames match the search.</td></tr>`}</tbody></table></div>`:'<p class="muted">No registered users yet.</p>';
+}
+async function loadUsers(){
+  const el=$('#usersList');
+  if(!el || $('#panel').classList.contains('hidden'))return;
+  el.textContent='Checking registered users and online links…';
+  try{
+    const [userRes,defaultRes]=await Promise.all([
+      fetch('/api/admin/users',{cache:'no-store'}),
+      fetch('/api/admin/users/publish-default',{cache:'no-store'}),
+    ]);
+    if(!userRes.ok||!defaultRes.ok)throw Error('Unable to load publishing permissions');
+    registeredUsers=await userRes.json();
+    $('#publishAllUsers').checked=!!(await defaultRes.json()).enabled;
+    renderUsersTable();
+    adminPublishNotificationBadge(registeredUsers.filter(u=>u.publish_requested).length);
+  }catch(e){el.textContent='Unable to load users: '+e.message;}
+}
+$('#usersSearch').addEventListener('input',renderUsersTable);
+$('#publishAllUsers').addEventListener('change',async e=>{
+  const checkbox=e.currentTarget;checkbox.disabled=true;
+  try{
+    const r=await post('/api/admin/users/publish-default',{enabled:checkbox.checked},'PUT');
+    const data=await r.json();if(!r.ok)throw Error(data.error||'Unable to update global publishing');
+    $('#usersMsg').textContent=checkbox.checked?'Publishing enabled by default for all accounts.':'Publishing disabled by default; individual permissions are retained.';
+    await loadUsers();
+  }catch(err){checkbox.checked=!checkbox.checked;$('#usersMsg').textContent=err.message;}
+  finally{checkbox.disabled=false;}
+});
+$('#usersList').addEventListener('click',e=>{
+  const sort=e.target.closest('[data-sort]');if(!sort)return;
+  const key=sort.dataset.sort;
+  if(!USER_COLUMNS.some(c=>c[0]===key))return;
+  usersSortDescending=usersSortKey===key?!usersSortDescending:false;
+  usersSortKey=key;renderUsersTable();
+});
+$("#usersList").addEventListener("change",async e=>{
+  const t=e.target.closest("[data-user-publish]");if(!t)return;
+  t.disabled=true;
+  try {
+    const r=await post(`/api/admin/users/${encodeURIComponent(t.dataset.userPublish)}/publish`,{enabled:t.checked},"PUT");
+    const j=await r.json();if(!r.ok)throw Error(j.error||"Could not save permission");
+    $("#usersMsg").textContent="Publishing permission updated.";
+    await loadUsers();
+  }catch(err){t.checked=!t.checked;$("#usersMsg").textContent=err.message;}
+  t.disabled=false;
+});
+let pendingDeleteUser=null;
+$("#usersList").addEventListener("click",e=>{
+  const btn=e.target.closest("[data-delete-user]");if(!btn)return;
+  pendingDeleteUser=btn.dataset.deleteUser;
+  $("#deleteUserDescription").textContent=`Permanently delete ${btn.dataset.deleteName}, their account, playlists, attributed interactions and submitted links? Music files will remain.`;
+  $("#deleteUserForm").reset();$("#deleteUserMsg").textContent="";
+  $("#deleteUserDlg").showModal();
+});
+$("#deleteUserCancel").onclick=()=>$("#deleteUserDlg").close();
+$("#deleteUserForm").onsubmit=async e=>{
+  e.preventDefault();
+  if(!pendingDeleteUser)return;
+  if($("#deleteUserWord").value.trim()!=="delete"){$("#deleteUserMsg").textContent='Type exactly "delete".';return;}
+  const btn=$("#deleteUserForm button[type=submit]");btn.disabled=true;
+  try{
+    const r=await post(`/api/admin/users/${encodeURIComponent(pendingDeleteUser)}`,{
+      password:$("#deleteUserPassword").value,confirm:$("#deleteUserWord").value},"DELETE");
+    const j=await r.json();if(!r.ok)throw Error(j.error||"Unable to delete account");
+    $("#deleteUserDlg").close();$("#usersMsg").textContent="User and attributed data deleted.";pendingDeleteUser=null;await loadUsers();
+  }catch(err){$("#deleteUserMsg").textContent=err.message;}finally{btn.disabled=false;}
+};
 
 async function show() {
   const { admin } = await (await fetch("/api/me")).json();
   $("#login").classList.toggle("hidden", admin);
   $("#panel").classList.toggle("hidden", !admin);
-  if (admin) { showPane(); refresh(); loadPlaylists(); loadRequests(); loadSite(); loadNetwork(); syncMode(); }
+  if (admin) {
+    const me=await(await fetch("/api/me",{cache:"no-store"})).json();
+    $("#adminAccountName").textContent=me.username||"admin";
+    $("#adminNewName").value=me.username||"admin";
+    showPane(); refresh(); loadPlaylists(); loadRequests(); loadSite(); loadNetwork(); loadMobileBridgeSettings(); syncMode();
+    fetch("/api/admin/version",{cache:"no-store"}).then(r=>r.json()).then(v=>{
+      $("#adminBuild").textContent=`WASP v${v.version||"?"} · ${v.label||""}`;
+    }).catch(()=>{$("#adminBuild").textContent="WASP · Version unavailable";});
+  }
 }
 function syncMode() {
   $("#plField").classList.toggle("hidden", mode() !== "playlist");
@@ -181,6 +325,75 @@ $("#plImg").addEventListener("change", async (e) => {
   else msg.textContent = (await r.json().catch(() => ({}))).error || "Upload failed.";
 });
 
+// Spotify settings live in Requests, not in public site branding settings.
+let spotifyConfigLoaded = false;
+function showRequestTab(spotify) {
+  $("#spotifyHttpsWarning").classList.toggle("hidden", location.protocol === "https:" || ["localhost", "127.0.0.1", ""].includes(location.hostname));
+  $("#reqTabQueue").setAttribute("aria-selected", String(!spotify));
+  $("#reqTabSpotify").setAttribute("aria-selected", String(spotify));
+  $("#reqQueuePanel").classList.toggle("hidden", spotify);
+  $("#reqSpotifyPanel").classList.toggle("hidden", !spotify);
+  if (spotify && !spotifyConfigLoaded) loadSpotifyConfig();
+}
+$("#reqTabQueue").addEventListener("click", () => { location.hash = "requests"; showRequestTab(false); });
+$("#reqTabSpotify").addEventListener("click", () => { location.hash = "requests/spotify"; showRequestTab(true); });
+async function loadSpotifyConfig() {
+  const state = $("#spotifyConfigState"), msg = $("#spotifyConfigMsg");
+  state.textContent = "Loading Spotify settings…";
+  try {
+    const r = await fetch("/api/admin/spotify-config", { headers: { accept: "application/json" }, cache: "no-store" });
+    const data = await r.json();
+    if (!r.ok) throw Error(data.error || "Unable to load settings.");
+    spotifyConfigLoaded = true;
+    $("#spotifyClientId").value = data.client_id || "";
+    $("#spotifyClientSecret").value = "";
+    $("#spotifySecretHint").textContent = data.saved_in_admin
+      ? "A secret is saved. Leave this field empty to keep it, or enter a new secret to replace it."
+      : (data.secret_configured ? "Credentials are supplied by the server environment. Enter new values to override them." : "Enter the Client ID and Client Secret from your Spotify Developer app.");
+    $("#spotifyConfigDelete").disabled = !data.saved_in_admin;
+    state.textContent = data.locked
+      ? "Saved credentials cannot be decrypted with the current server key. Enter a new secret to repair them."
+      : (data.saved_in_admin ? "Spotify credentials saved securely on this server." : data.source === "environment" ? "Using credentials supplied by the server environment." : "Spotify playlist search is not configured.");
+    if (!data.storage_ready) {
+      state.textContent += " To save credentials in this page, first configure SPOTIFY_SETTINGS_KEY as a server secret.";
+    }
+    msg.textContent = "";
+  } catch (e) {
+    spotifyConfigLoaded = false;
+    state.textContent = "";
+    flashMsg("#spotifyConfigMsg", e.message || "Unable to load settings.", true);
+  }
+}
+$("#spotifySettingsForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const save = $("#spotifyConfigSave");
+  const id = $("#spotifyClientId").value.trim(), secret = $("#spotifyClientSecret").value;
+  save.disabled = true;
+  try {
+    const r = await post("/api/admin/spotify-config", { client_id: id, client_secret: secret }, "PUT");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw Error(d.error || "Unable to save Spotify credentials.");
+    $("#spotifyClientSecret").value = "";
+    spotifyConfigLoaded = false;
+    await loadSpotifyConfig();
+    flashMsg("#spotifyConfigMsg", "Spotify credentials saved. Playlist search will use them if Spotify grants API access.");
+  } catch (e) { flashMsg("#spotifyConfigMsg", e.message, true); }
+  finally { save.disabled = false; }
+});
+$("#spotifyConfigDelete").addEventListener("click", async () => {
+  if (!confirm("Remove saved Spotify credentials from this server? The paste-link option will still work.")) return;
+  const btn = $("#spotifyConfigDelete"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/admin/spotify-config", { method: "DELETE" });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw Error(d.error || "Unable to remove credentials.");
+    spotifyConfigLoaded = false;
+    await loadSpotifyConfig();
+    flashMsg("#spotifyConfigMsg", "Saved Spotify credentials removed.");
+  } catch (e) { flashMsg("#spotifyConfigMsg", e.message, true); }
+  finally { btn.disabled = false; }
+});
+
 // ---------- requests ----------
 const openReq = new Set();
 async function loadRequests() {
@@ -255,7 +468,10 @@ function send(file, meta, hash, pid, onProgress) {
     x.send(file);
   });
 }
-const sha = async (file) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const sha = async (file) => {
+  if(!globalThis.crypto?.subtle)throw Error('File hashing requires a trusted HTTPS connection (or localhost). Please open WASP using HTTPS with a valid certificate.');
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256",await file.arrayBuffer()))].map(b=>b.toString(16).padStart(2,"0")).join("");
+};
 
 async function enqueue(fileList) {
   const m = mode(), msg = $("#upMsg");
@@ -355,16 +571,35 @@ $("#files").addEventListener("change", (e) => { enqueue(e.target.files); e.targe
 ["dragleave", "drop"].forEach((n) => drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
 drop.addEventListener("drop", (e) => enqueue(e.dataTransfer.files));
 
+// WASP v16 Mobile Bridge is opt-in and does not change native WASP settings.
+async function loadMobileBridgeSettings(){
+  const field=document.querySelector('#mobileBridgeToggle'),status=document.querySelector('#mobileBridgeAdminStatus');
+  if(!field||!status)return;
+  try{const r=await fetch('/api/admin/mobile-bridge',{cache:'no-store'});if(!r.ok)throw Error('Unable to read Mobile Bridge settings');
+    const data=await r.json();field.checked=!!data.enabled;
+    status.textContent=data.secret_ready?'Encryption secret configured.':'Set MOBILE_BRIDGE_SECRET on the staging Worker before generating mobile device credentials.';
+  }catch(e){status.textContent=e.message;status.classList.add('err');}
+}
+document.querySelector('#mobileBridgeSave')?.addEventListener('click',async()=>{
+  const field=document.querySelector('#mobileBridgeToggle'),status=document.querySelector('#mobileBridgeAdminStatus');
+  try{const r=await fetch('/api/admin/mobile-bridge',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({enabled:field.checked})});
+    const data=await r.json();if(!r.ok)throw Error(data.error||'Unable to save Mobile Bridge settings');
+    status.textContent='Mobile Bridge '+(data.enabled?'enabled':'disabled')+'.';status.classList.remove('err');
+  }catch(e){status.textContent=e.message;status.classList.add('err');}
+});
 // ---------- general settings: branding + advertising ----------
 let site = null;
 function paintFavicon() {
   const on = !!(site && site.favicon);
   $("#favPrev").classList.toggle("hidden", !on); $("#favNone").classList.toggle("hidden", on); $("#favRm").classList.toggle("hidden", !on);
-  if (on) { $("#favPrev").src = `/site/favicon?v=${site.favicon}`; $("#favicon").href = `/site/favicon?v=${site.favicon}`; }
+  $("#favicon").href = on ? `/site/favicon?v=${site.favicon}` : "/wasp-icon.png";
+  if (on) { $("#favPrev").src = `/site/favicon?v=${site.favicon}`; }
 }
 async function loadSite() {
   try { site = await (await fetch("/api/site")).json(); } catch { return; }
-  $("#siteName").value = site.name; $("#tabTitle").value = site.title;
+  $("#siteName").value = site.name; $("#tabTitle").value = site.title; $("#brandIconOn").checked = !!site.show_brand_icon;
+  $("#brandMode").value=site.brand_mode||"text";paintBrandImage();
+  $("#sidebarOn").checked=!!site.sidebar?.enabled;$("#sidebarCode").value=site.sidebar?.bbcode!==null && site.sidebar?.bbcode!==undefined ? site.sidebar.bbcode : (site.sidebar?.html ? legacySidebarToBBCode(site.sidebar.html) : "");paintSidebarPreview();
   $("#spOn").checked = site.ad.enabled; $("#spH").value = site.ad.height; $("#spCode").value = site.ad.html;
   document.title = `Admin · ${site.title || site.name}`;
   paintFavicon();
@@ -375,7 +610,32 @@ async function saveSettings(body, msgSel) {
   if (!r.ok) { flashMsg(msgSel, (await r.json().catch(() => ({}))).error || "Couldn't save.", true); return false; }
   site = await r.json(); flashMsg(msgSel, "Saved."); document.title = `Admin · ${site.title || site.name}`; return true;
 }
-$("#brandSave").addEventListener("click", () => saveSettings({ site_name: $("#siteName").value, tab_title: $("#tabTitle").value }, "#brandMsg"));
+function paintBrandImage(){
+  const on=!!site?.brand_v;
+  $("#brandPreview").classList.toggle("hidden",!on);
+  if(on)$("#brandPreview").src=`/site/brand?v=${site.brand_v}`;
+  $("#brandImageRemove").classList.toggle("hidden",!on);
+}
+$("#brandSave").addEventListener("click", () => saveSettings({ site_name: $("#siteName").value, tab_title: $("#tabTitle").value, show_brand_icon: $("#brandIconOn").checked,brand_mode:$("#brandMode").value }, "#brandMsg"));
+$("#brandImageBtn").onclick=()=>$("#brandImageFile").click();
+$("#brandImageFile").onchange=async e=>{
+  const f=e.target.files[0];e.target.value="";if(!f)return;
+  const r=await fetch("/api/admin/brand-image",{method:"PUT",headers:{"content-type":f.type},body:f});
+  const data=await r.json().catch(()=>({}));
+  if(r.ok){site.brand_v=data.brand_v;$("#brandMode").value="image";paintBrandImage();flashMsg("#brandMsg","Image uploaded; click Save branding to activate.");}
+  else flashMsg("#brandMsg",data.error||"Image upload failed",true);
+};
+$("#brandImageRemove").onclick=async()=>{
+  if(!confirm("Remove the site name image?"))return;
+  const r=await fetch("/api/admin/brand-image",{method:"DELETE"});
+  if(r.ok){site.brand_v=0;$("#brandMode").value="text";paintBrandImage();flashMsg("#brandMsg","Image removed. Save branding to switch to text.");}
+};
+function paintSidebarPreview(){
+  const preview=$("#sidebarPreview");if(!preview)return;
+  renderSidebarBBCode(preview,$("#sidebarCode").value);
+}
+$("#sidebarCode").addEventListener("input",paintSidebarPreview);
+$("#sidebarSave").onclick=()=>saveSettings({sidebar_enabled:$("#sidebarOn").checked,sidebar_bbcode:$("#sidebarCode").value},"#sidebarMsg");
 $("#favBtn").addEventListener("click", () => $("#favFile").click());
 $("#favFile").addEventListener("change", async (e) => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
@@ -588,6 +848,15 @@ $("#spPreviewBtn").addEventListener("click", () => {
 });
 $("#spSave").addEventListener("click", () => saveSettings({ ad_enabled: $("#spOn").checked, ad_html: $("#spCode").value, ad_height: $("#spH").value }, "#spMsg"));
 
+// Administrator role remains bound to the server-side session, never to a username.
+$("#adminNameForm").addEventListener("submit",async e=>{
+  e.preventDefault();const f=e.currentTarget;
+  const r=await post("/api/admin/username",{username:$("#adminNewName").value,password:$("#adminNamePassword").value},"PUT");
+  const j=await r.json().catch(()=>({}));
+  $("#adminNamePassword").value="";
+  if(r.ok){$("#adminAccountName").textContent=j.username;flashMsg("#acctMsg","Administrator username updated.");}
+  else flashMsg("#acctMsg",j.error||"Could not change username.",true);
+});
 // ---------- account settings: the password window only opens on click ----------
 const pwDlg = $("#pwDlg");
 $("#pwOpen").addEventListener("click", () => { $("#pwForm").reset(); $("#pwMsg").textContent = ""; pwDlg.showModal(); $("#cur").focus(); });
@@ -620,6 +889,93 @@ $("#cleanForm").addEventListener("submit", async (e) => {
   } else { $("#cMsg").textContent = j.error || "Something went wrong."; cCheck(); }
 });
 
+// ---------- Network → Crons ----------
+const CRON_LABELS={peers:"Check connected peers for new tracks",artwork:"Fetch missing artist/album artwork",biography:"Check artist biographies and lineups",hash:"SHA-256 hash local /music folder (Docker only)"};
+const CRON_KEYS=Object.keys(CRON_LABELS);
+const cronWeekdays=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+const availableZones=()=>{
+  let zones=[];
+  try{zones=Intl.supportedValuesOf("timeZone");}catch{}
+  return [...new Set(["Asia/Manila","UTC",...zones])].sort();
+};
+let cronsLoaded=false;
+function showNetworkTab(crons){
+  $("#netTabPeers").setAttribute("aria-selected",String(!crons));
+  $("#netTabCrons").setAttribute("aria-selected",String(crons));
+  $("#netPeersPanel").classList.toggle("hidden",crons);
+  $("#netCronsPanel").classList.toggle("hidden",!crons);
+  if(crons&&!cronsLoaded)loadCrons();
+}
+$("#netTabPeers").onclick=()=>{location.hash="network";showNetworkTab(false);};
+$("#netTabCrons").onclick=()=>{location.hash="network/crons";showNetworkTab(true);};
+function cronJobTemplate(key){
+  const id="cron-"+key;
+  return `<fieldset class="cron-job" id="${id}" style="border:1px solid var(--line2);border-radius:12px;margin:16px 0;padding:14px">
+    <legend><label><input type="checkbox" data-cron="${key}" data-field="enabled"> ${CRON_LABELS[key]}</label></legend>
+    ${key==="peers"?`<label class="check" style="margin:8px 0 12px 12px"><input type="checkbox" data-cron="peers" data-field="sync_catalogue"> Sync peer catalogues and playlists (metadata only)</label>`:""}
+    <div class="cron-fields">
+      <label>Repeat
+        <select data-cron="${key}" data-field="frequency"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select>
+      </label>
+      <label data-schedule="daily">Time (24-hour)
+        <input type="time" data-cron="${key}" data-field="time" value="02:00" step="60">
+      </label>
+      <label data-schedule="weekly" class="hidden">Day of week
+        <select data-cron="${key}" data-field="weekday">${cronWeekdays.map((day,i)=>`<option value="${i}">${day}</option>`).join("")}</select>
+      </label>
+      <label data-schedule="monthly" class="hidden">Day of month
+        <select data-cron="${key}" data-field="monthday">${Array.from({length:30},(_,i)=>`<option value="${i+1}">${i+1}</option>`).join("")}</select>
+      </label>
+    </div>
+  </fieldset>`;
+}
+$("#cronJobs").innerHTML=CRON_KEYS.map(cronJobTemplate).join("");
+const cronField=(key,field)=>document.querySelector(`[data-cron="${key}"][data-field="${field}"]`);
+function syncCronFields(key){
+  const group=$("#cron-"+key),enabled=cronField(key,"enabled").checked,frequency=cronField(key,"frequency").value;
+  group.querySelectorAll("[data-schedule]").forEach(el=>el.classList.toggle("hidden",el.dataset.schedule!==frequency));
+  group.querySelector(".cron-fields").classList.toggle("cron-disabled",!enabled);
+}
+$("#cronJobs").addEventListener("change",e=>{
+  const key=e.target.dataset.cron;if(key)syncCronFields(key);
+});
+async function loadCrons(){
+  try{
+    const res=await fetch("/api/admin/crons",{cache:"no-store"});
+    if(!res.ok)throw Error("Unable to load schedules");
+    const config=await res.json(),tz=$("#cronTimezone");
+    const zones=availableZones();
+    if(config.timezone&&!zones.includes(config.timezone))zones.unshift(config.timezone);
+    tz.innerHTML=zones.map(z=>`<option value="${esc(z)}">${esc(z)}</option>`).join("");
+    tz.value=config.timezone||"UTC";
+    for(const key of CRON_KEYS){
+      const job=config.jobs?.[key]||{};
+      for(const field of ["enabled","frequency","time","weekday","monthday"]){
+        const input=cronField(key,field);if(job[field]!==undefined){
+          if(field==="enabled")input.checked=!!job[field];else input.value=String(job[field]);
+        }
+      }
+      if(key==="peers")cronField(key,"sync_catalogue").checked=!!job.sync_catalogue;
+      syncCronFields(key);
+    }
+    cronsLoaded=true;
+  }catch(e){$("#cronMsg").textContent=e.message||"Unable to load schedules";}
+}
+$("#cronForm").addEventListener("submit",async e=>{
+  e.preventDefault();const btn=$("#cronSave");btn.disabled=true;
+  const config={timezone:$("#cronTimezone").value,jobs:{}};
+  for(const key of CRON_KEYS){
+    config.jobs[key]={enabled:cronField(key,"enabled").checked,
+      ...(key==="peers"?{sync_catalogue:cronField(key,"sync_catalogue").checked}:{}),
+      frequency:cronField(key,"frequency").value,time:cronField(key,"time").value,
+      weekday:Number(cronField(key,"weekday").value),monthday:Number(cronField(key,"monthday").value)};
+  }
+  try{const res=await post("/api/admin/crons",config,"PUT");const result=await res.json();
+    if(!res.ok)throw Error(result.error||"Unable to save schedules");
+    flashMsg("#cronMsg","Schedules saved successfully.");
+  }catch(e){flashMsg("#cronMsg",e.message,true);}finally{btn.disabled=false;}
+});
+
 // ---------- network (peer-to-peer) ----------
 function paintNetShare(on) {
   $("#netShare").checked = !!on;
@@ -632,8 +988,10 @@ function peerRow(p) {
     ? `<span style="color:var(--accent)">Connected</span> · ${p.track_count || 0} songs`
     : `<span style="color:var(--danger)">Offline</span>${p.last_error ? ` · ${esc(p.last_error)}` : ""}`;
   return `<tr data-peer="${p.id}">
+    <td style="width:46px"><input type="radio" name="primaryPeer" data-primary="${esc(p.id)}" aria-label="Treat ${esc(p.name||p.url)} as local" ${p.is_primary?"checked":""}></td>
     <td><b>${esc(p.name || p.url)}</b><br><span class="muted" style="word-break:break-all">${esc(p.url)}</span><br><span class="muted">${status}</span></td>
     <td style="text-align:right;white-space:nowrap">
+      <button class="btn ghost" data-a="sync" title="Sync metadata only; no music files downloaded" aria-label="Cloud sync metadata" ${small}>☁ ↻</button>
       <button class="btn ghost" data-a="refresh" ${small}>Refresh</button>
       <button class="btn danger" data-a="rm" ${small}>Remove</button>
     </td></tr>`;
@@ -644,7 +1002,7 @@ async function loadNetwork() {
     paintNetShare(d.share);
     window.__peers = d.peers || [];
     $("#netPeers").innerHTML = window.__peers.length
-      ? `<table><tbody>${window.__peers.map(peerRow).join("")}</tbody></table>`
+      ? `<p class="muted">Select one peer to treat its catalogue as local, without downloading its audio. <label><input type="radio" name="primaryPeer" data-primary="" ${!d.primary_peer_id?"checked":""}> None</label></p><table><tbody>${window.__peers.map(peerRow).join("")}</tbody></table>`
       : "No peers yet.";
   } catch {
     $("#netPeers").textContent = "Could not load network settings.";
@@ -693,6 +1051,15 @@ $("#netConnect").addEventListener("click", async () => {
   $("#netAddForm").classList.add("hidden");
   await loadNetwork();
 });
+$("#netPeers").addEventListener("change",async e=>{
+  if(e.target.name!=="primaryPeer")return;
+  const id=e.target.dataset.primary;
+  const response=await post("/api/admin/network/primary",{peer_id:id},"PUT");
+  const result=await response.json().catch(()=>({}));
+  flashMsg("#netMsg",response.ok?(id?"Primary peer selected. Its catalogue will appear as local on the website.":"Using only this server as local."):(result.error||"Could not select primary peer"),!response.ok);
+  await loadNetwork();
+  if(response.ok)try{localStorage.setItem("wasp_peer_sync",String(Date.now()));}catch{}
+});
 $("#netPeers").addEventListener("click", async (e) => {
   const b = e.target.closest("button"); if (!b || !b.dataset.a) return;
   const id = b.closest("tr").dataset.peer;
@@ -702,15 +1069,122 @@ $("#netPeers").addEventListener("click", async (e) => {
     await loadNetwork();
     return;
   }
-  if (b.dataset.a === "refresh") {
-    b.disabled = true; const label = b.textContent; b.textContent = "…";
-    const r = await fetch("/api/admin/network/peers/" + id + "/refresh", { method: "POST" });
-    const j = await r.json().catch(() => ({}));
-    b.disabled = false; b.textContent = label;
-    if (!r.ok) flashMsg("#netMsg", j.error || "Refresh failed.", true);
-    else flashMsg("#netMsg", `Updated “${j.name}”: ${j.track_count || 0} songs.`);
-    await loadNetwork();
+  if (b.dataset.a === "refresh" || b.dataset.a === "sync") {
+    const hard=b.dataset.a==="refresh",label=b.textContent, buttons=[...b.closest("tr").querySelectorAll("button")];
+    buttons.forEach(x=>x.disabled=true);b.textContent="Syncing…";
+    const meter=$("#netSyncProgress"),bar=$("#netSyncBar"),message=$("#netSyncStatus");
+    meter.hidden=false;bar.value=0;message.textContent=hard?"Refreshing peer information…":"Syncing peer metadata…";
+    try {
+      if(hard){const r=await fetch(`/api/admin/network/peers/${encodeURIComponent(id)}/refresh`,{method:"POST",cache:"no-store"});
+        const j=await r.json();if(!r.ok)throw Error(j.error||"Peer refresh failed");}
+      const totals={};const phases=[["tracks",40],["playlists",70],["users",95],["finish",100]];
+      for(const [phase,percent] of phases){
+        message.textContent=`${phase==="finish"?"Publishing":`Syncing ${phase}`}…`;
+        const r=await post(`/api/admin/network/peers/${encodeURIComponent(id)}/sync`,{phase});
+        const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||`Unable to sync ${phase}`);
+        totals[phase]=j.count||0;bar.value=percent;
+      }
+      message.textContent=`Complete: ${totals.tracks} songs, ${totals.playlists} server playlists, ${totals.users} user playlists.`;
+      flashMsg("#netMsg",`Synced ${totals.tracks} songs and ${totals.playlists+totals.users} playlists. No audio files downloaded.`);
+      // Notify other tabs on the same origin. Their periodic revision check will reload.
+      try{localStorage.setItem("wasp_peer_sync",String(Date.now()));}catch{}
+      await loadNetwork();
+    } catch(err){message.textContent=err.message;flashMsg("#netMsg",err.message,true);}
+    finally{buttons.forEach(x=>x.disabled=false);b.textContent=label;}
   }
 });
 
 show();
+
+// Admin-only, read-only documentation viewer. Markdown source is bundled at
+// build time; the public static directory never exposes these files.
+let docsLoaded=false;
+const mdEscape=(s)=>esc(String(s||""));
+function mdInline(text){
+  let safe=mdEscape(text);
+  safe=safe.replace(/`([^`]+)`/g,(_,t)=>`<code>${t}</code>`);
+  safe=safe.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  safe=safe.replace(/\*([^*]+)\*/g,'<em>$1</em>');
+  safe=safe.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,(_,label,url)=>`<a href="${url.replace(/&amp;/g,'&amp;')}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+  return safe;
+}
+function docsMarkdown(src){
+  let html='',code=[],mode=false,ul=false,ol=false,table=false;
+  const close=()=>{if(ul){html+='</ul>';ul=false;}if(ol){html+='</ol>';ol=false;}if(table){html+='</tbody></table>';table=false;}};
+  for(const line of String(src||"").split(/\r?\n/)){
+    if(/^```/.test(line)){close();if(mode){html+=`<pre><code>${mdEscape(code.join('\n'))}</code></pre>`;code=[];mode=false;}else mode=true;continue;}
+    if(mode){code.push(line);continue;}
+    if(!line.trim()){close();continue;}
+    const h=/^(#{1,6})\s+(.+)$/.exec(line);
+    if(h){close();html+=`<h${h[1].length}>${mdInline(h[2])}</h${h[1].length}>`;continue;}
+    if(/^\s*---+\s*$/.test(line)){close();html+='<hr>';continue;}
+    if(line.includes('|') && /^\s*\|?\s*:?[-]{3}/.test(line)){continue;}
+    if(/^\s*\|(.+)\|\s*$/.test(line)){
+      if(ul){html+='</ul>';ul=false;}if(ol){html+='</ol>';ol=false;}
+      if(!table){html+='<table><tbody>';table=true;}
+      html+='<tr>'+line.trim().replace(/^\||\|$/g,'').split('|').map(c=>`<td>${mdInline(c.trim())}</td>`).join('')+'</tr>';continue;
+    }
+    const bullet=/^\s*[-*]\s+(.+)$/.exec(line),number=/^\s*\d+\.\s+(.+)$/.exec(line);
+    if(bullet||number){if(table){html+='</tbody></table>';table=false;}
+      if(bullet&&!ul){if(ol){html+='</ol>';ol=false;}html+='<ul>';ul=true;}
+      if(number&&!ol){if(ul){html+='</ul>';ul=false;}html+='<ol>';ol=true;}
+      html+=`<li>${mdInline((bullet||number)[1])}</li>`;continue;}
+    close();if(/^>/.test(line))html+=`<blockquote>${mdInline(line.replace(/^>\s?/,''))}</blockquote>`;
+    else html+=`<p>${mdInline(line)}</p>`;
+  }
+  close();if(mode)html+=`<pre><code>${mdEscape(code.join('\n'))}</code></pre>`;
+  return html;
+}
+async function loadDocs(){
+  if(docsLoaded)return;
+  try{
+    const r=await fetch('/api/admin/docs',{cache:'no-store'});if(!r.ok)throw Error('Unable to load documentation');
+    const docs=await r.json();const select=$('#docsSelect');
+    select.innerHTML=docs.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('');
+    docsLoaded=true;if(docs.length)await showDoc(docs[0].name);
+    else $('#docsMsg').textContent='No release notes available.';
+  }catch(e){flashMsg('#docsMsg',e.message,true);}
+}
+async function showDoc(name){
+  try{
+    const r=await fetch('/api/admin/docs?name='+encodeURIComponent(name),{cache:'no-store'});
+    if(!r.ok)throw Error('Unable to load document');
+    const doc=await r.json();$('#docsBody').innerHTML=docsMarkdown(doc.content);
+    $('#docsMsg').textContent=doc.name;
+  }catch(e){flashMsg('#docsMsg',e.message,true);}
+}
+$('#docsSelect').onchange=e=>showDoc(e.target.value);
+
+// WASP v15: read-only exact-file duplicate audit. Deletion is allowed only
+// for an unreferenced, unplayed, web-uploaded duplicate; /music stays read-only.
+let duplicateRefreshBusy=false;
+async function loadDuplicates(){
+  if(duplicateRefreshBusy)return;duplicateRefreshBusy=true;
+  try{
+    const r=await fetch('/api/admin/duplicates',{cache:'no-store'});
+    const result=await r.json();if(!r.ok)throw Error(result.error||'Unable to load duplicates');
+    $('#duplicateCount').textContent=result.duplicate_count||0;
+    const st=result.status||{},pct=st.total?Math.round((st.scanned||0)*100/st.total):0;
+    $('#hashScanProgress').value=Math.max(0,Math.min(100,pct));
+    $('#hashScanState').textContent=`${st.state||'not_run'} · ${(st.scanned||0).toLocaleString()} / ${(st.total||0).toLocaleString()} files · ${(st.changed||0).toLocaleString()} newly hashed`+(st.error?' · '+st.error:'');
+    $('#duplicateList').innerHTML=result.groups?.length?result.groups.map(g=>`<section class="card" style="background:transparent"><b>${g.qty} identical files</b><p class="muted">SHA-256: <code>${esc(g.sha)}</code></p><table><thead><tr><th>Song</th><th>Source</th><th>Size</th><th>Action</th></tr></thead><tbody>${(g.items||[]).map(item=>`<tr><td>${esc(item.title||item.id)}<br><span class="muted">${esc(item.source_path||item.artist||'')}</span></td><td>${esc(item.source)}</td><td>${(Number(item.size)||0).toLocaleString()} bytes</td><td>${item.source==='upload'?`<button class="btn danger" data-duplicate-delete="${esc(item.id)}">Review delete</button>`:'Read-only'}</td></tr>`).join('')}</tbody></table></section>`).join(''):'<p class="muted">No exact duplicates indexed yet. Schedule a scan or scan now.</p>';
+  }catch(e){flashMsg('#duplicateMsg',e.message,true);}finally{duplicateRefreshBusy=false;}
+}
+$('#hashScanNow').onclick=async()=>{
+  const r=await post('/api/admin/hash-scan',{}),data=await r.json().catch(()=>({}));
+  flashMsg('#hashScanMsg',r.ok?'Folder scan queued; progress updates here.':(data.error||'Failed to queue scan'),!r.ok);
+  if(r.ok)loadDuplicates();
+};
+$('#duplicateList').onclick=async e=>{
+  const btn=e.target.closest('button[data-duplicate-delete]');if(!btn)return;
+  const id=btn.dataset.duplicateDelete;
+  if(!confirm('This will permanently delete this managed upload ONLY if an identical file survives and it has no plays, reactions or playlist references. Continue?'))return;
+  const word=prompt('To confirm, type: delete duplicate');if(word!=='delete duplicate')return;
+  const r=await fetch('/api/admin/duplicates/'+encodeURIComponent(id),{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({confirm:word})});
+  const data=await r.json().catch(()=>({}));flashMsg('#duplicateMsg',r.ok?'Eligible duplicate deleted.':(data.error||'Deletion refused'),!r.ok);
+  if(r.ok){await loadDuplicates();refresh();}
+};
+setInterval(()=>{if(location.hash.startsWith('#duplicates'))loadDuplicates();},12000);
+
+// Low-frequency polling for outstanding publishing requests; no user addresses are exposed.
+setInterval(pollAdminPublishRequests,30000);
