@@ -1,13 +1,14 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // IMPORTANT: this name must match the Worker name in your Cloudflare Git build settings.
-  "name": "music-app",
+  // STAGING ONLY. Keep this Worker name distinct from the production Worker.
+  "name": "wasp-v16-staging",
   "main": "src/index.js",
   "compatibility_date": "2025-10-01",
+  "triggers": { "crons": ["* * * * *"] },
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*", "/audio/*", "/art/*", "/site/*"]
+    "run_worker_first": ["/api/*", "/audio/*", "/art/*", "/site/*", "/mobile", "/mobile/*", "/rest/*"]
   },
   // No IDs on purpose: Wrangler creates these on first deploy and keeps them linked.
   "r2_buckets": [{ "binding": "MUSIC" }],

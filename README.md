@@ -1,229 +1,146 @@
-# Music app (Cloudflare Workers + R2 + D1)
+<div align="center">
+  <img src="public/wasp-mascot.png" width="170" alt="WASP yellow-and-black wasp mascot on transparent background">
+  <h1>WASP</h1>
+  <p><strong>Peer-to-peer music, hosted your way.</strong></p>
+</div>
 
-A public music player anyone can listen to, with an admin area (gear icon, top right) for uploading and managing mp3 files.
 
-## Deploy from GitHub (no manual resource setup)
+> [!IMPORTANT]
+> **WASP v16.0.0 STAGING — Mobile Bridge (Subsonic / OpenSubsonic translator)**
+> This repository contains a **test release** intended for a **separate GitHub repository, Cloudflare Worker, D1 database, R2 bucket and Docker stack**, not an in-place upgrade over your active v15 site. Keep your existing v15 server as a read-only network peer supplying music to v16. The `/mobile` endpoint is optional and disabled by default. **Start with [the v16 staging deployment and security guide](docs/V16-0-0-MOBILE-BRIDGE-STAGING.md)** before importing this source.
 
-1. Push this folder to a GitHub repo.
-2. Cloudflare dashboard > **R2** > enable R2 once for your account (needed before any bucket can be created).
-3. **Workers & Pages > Create > Import a repository** (Workers), pick the repo.
-4. Leave the build command empty and the deploy command as `npx wrangler deploy`.
-   The Worker name must match `"name"` in `wrangler.jsonc` (`music-app`).
-5. Deploy. Wrangler creates the R2 bucket and D1 database and binds them automatically.
-   The database tables are created on the first request.
+WASP is a **peer-to-peer music webapp** that lets people host their own music libraries and connect them to other WASP-compatible servers. You can listen to music on your own server or discover music shared by connected hosts. Each host controls their own library and whether to share it over the network.
 
-## First login
+You can deploy WASP locally for development, on **Cloudflare Workers**, or on your own server using **Docker / Portainer**. For self-hosted Docker installations, music can be uploaded through the webapp or indexed from an existing folder on the host server.
 
-Click the gear icon (top right of the site).
+> [!CAUTION]
+> **CHANGE THE DEFAULT ADMIN PASSWORD IMMEDIATELY.** Every fresh installation uses a known default credential. Anyone who can reach an installation that still uses it may be able to sign in as administrator. **Do not make your library public, open it to the internet, or enable “Share this library on the network” until you have changed the password.** Use a strong, unique password.
+>
+> Initial admin ID: `admin`  
+> Initial admin password: `21232f297a57a5a743894a0e4a801fc3`  
+> Once signed in, open **Admin → Account settings** to change it.
 
-- ID: `admin`
-- Password: `21232f297a57a5a743894a0e4a801fc3`
 
-Then use **Change password** on the admin page. The password is stored only as a salted PBKDF2 hash in D1.
+### v15.0.5: Member account management and community publishing
 
-## Uploading (admin page)
+Administrators can change their login username in **Admin → Account settings**, while members can change theirs under **Account settings → Account**. Members also have a **Publish** tab for contributing their own public HTTPS WASP links, but an administrator must first enable publishing for each account under **Admin → Users**. The admin Users screen shows submitted and online link counts without displaying user-submitted addresses and provides password-confirmed account deletion. Submitted links are peers only, never automatically the local/primary library. Existing administrator-managed private Bridge peers remain separate. See [`docs/V15-0-5-ACCOUNT-COMMUNITY-PUBLISH.md`](docs/V15-0-5-ACCOUNT-COMMUNITY-PUBLISH.md) for safety/privacy limitations, destructive-action precautions and staging tests.
 
-Choose how to upload, then drop .mp3 files:
+### v15.0.4: Collapsible icon sidebar
 
-- **Singles**: filed under the artist. If a file's tags include an album, it is filed under that album.
-- **Playlist**: filed by artist and album from the tags, and every song is also added to the playlist you name
-  (an existing name adds to that playlist). A song can be in many playlists.
-- **Album**: filed under the artist's album. Album and artist fields are optional overrides of the tags.
+The public WASP sidebar starts fully expanded. Use the new arrow control at the top of the sidebar navigation to tuck it into a compact icon rail, giving more horizontal room to playlists, artists and songs. The compact rail uses the supplied colored/monochrome nav icons in rounded-square frames; hover over an icon to see its tab name. All links remain accessible and clickable, and sidebar BBCode credits are simply hidden until expanded. The choice is remembered in this browser. On phones, the existing horizontal text navigation remains. No data migration is required. See [`docs/V15-0-4-COLLAPSIBLE-SIDEBAR.md`](docs/V15-0-4-COLLAPSIBLE-SIDEBAR.md).
 
-A song that is already stored (same file contents) is never uploaded twice. In playlist mode it is added to the playlist instead.
+### v15.0.3: Embedded artwork fallback
 
-## Listener features
+If Deezer has no match for an artist, album, or track cover, WASP tries JPEG/PNG/WebP art embedded in the original MP3 (including existing R2 uploads and Docker read-only `/music` files). Peer song cards can also try embedded artwork through the peer relay. Audio files are never modified; see `docs/V15-0-3-EMBEDDED-ARTWORK-FALLBACK.md` for supported tags and limits.
 
-Layout: a menu on the left; the active tab opens its sub tabs under it. Songs are shown as tiles. Tabs: recently added (with Songs, Artists, Albums and Playlists underneath, newest first), most listened, artists,
-playlists, and the top 50 most hearted, top 20 most liked and top 20 most disliked songs. Playlist covers show a 3x3
-grid of album art (9+ albums) or a 2x2 grid. Player: heart, like and dislike beside the song;
-shuffle (click for a slide-up menu: all songs, this artist, this playlist), previous, play, next and repeat (each song 2x or 3x) in the centre;
-lyrics, Up next and volume on the right. Buttons are icons with a name on hover.
+## WASP v15.0.2 — BBCode sidebar footer
 
-## Admin sections
+The Admin **Sidebar credits and branding** editor now accepts a small, safe BBCode subset (text formatting, links, images and colors) instead of arbitrary HTML/JavaScript. A live preview is provided. On the public site, credits use a compact 11px font and stay pinned to the **bottom of the sidebar**, growing upward as lines are added. Existing saved HTML remains in settings for rollback and is safely converted for display/editing until BBCode is saved. See [`docs/V15-0-2-SIDEBAR-BBCODE.md`](docs/V15-0-2-SIDEBAR-BBCODE.md) for tag examples, limitations and deployment notes.
 
-The admin page has a menu on the left: **Music collection** (30 songs per page), **Add music** (with an overall "10 out of 30" progress bar),
-**Playlists**, **Requests**, **General settings**, **Account settings** (the Change password window opens only when you click it), **Network** (peer-to-peer library sharing) and **Danger** (clean database).
+## WASP v15.0.1 — Feature completion / deployment verification
 
-**General settings > Branding** changes the site name (top left of the site, click it to go home), the browser tab name and the browser icon.
-**General settings > Advertising** lets only the admin write an ad in HTML, CSS and JavaScript. It shows at the top of the front page
-(Recently added > Songs), above the songs, only while it is switched on. It runs in a sandboxed frame, so it cannot reach the rest of the
-site or the admin session. Links open in a new tab; add `target="_top"` to a link to stay in the app.
+v15.0.1 corrects primary-peer preference when a song also exists in local storage, keeps the last synced peer metadata during transient peer failures, prunes stale SHA-256 records without touching `/music`, and repairs an already-marked-v15 database if the peer-chunk table is missing. Browser entrypoints are cache-versioned. **The ZIP does not install itself**: update the GitHub/Portainer source and rebuild Docker, and deploy the Cloudflare Worker separately. Verify the admin version label before troubleshooting a missing feature. See [`docs/V15-0-1-FEATURE-COMPLETION.md`](docs/V15-0-1-FEATURE-COMPLETION.md) for the complete nine-feature activation checklist, data precautions, and limitations.
 
-## Network (peer-to-peer libraries)
+## WASP v15 — Federated library and storage management
 
-Several people can host their own copy of this app and link them together.
+This version introduces an administrator-selectable **primary peer** (Admin → Network → Connected peers → Treat as local), **SHA-256 duplicate management** (Admin → Duplicate management), an optional **incremental hash cron** (Admin → Network → Crons), **text/image site branding**, configurable **sandboxed sidebar credits**, a simplified **Recently listened** display, and an admin-only **Update documentations** Markdown viewer. The Cloudflare site can present one reachable peer as its local catalogue without downloading that peer's MP3 files; it does **not** automatically migrate R2 audio or make private Tailscale endpoints reachable from Cloudflare.
 
-1. On instance A, open **Admin → Network**, turn on **Share this library on the network**, and copy the share link.
-2. On instance B, open **Admin → Network**, click **+ Add peer**, paste A’s link and **Connect**.
-3. When the peer is online, its songs appear in B’s public library. Playback streams audio and artwork directly from A (nothing is copied into B’s R2).
+The v15 additive migration first repairs the `peer_catalogue_chunks` missing-table defect affecting some existing v14.0.3 installations. **Back up D1, R2 and all Docker volumes, then test on staging before upgrading production.** Never remove application state volumes during a Portainer update. Audio in `/music` remains read-only, and duplicate deletion is manually confirmed and limited to eligible web-uploaded copies with no playlist/reaction/play references. See [`docs/V15-0-0-FEDERATED-LIBRARY.md`](docs/V15-0-0-FEDERATED-LIBRARY.md) for migration checks, implementation limits and deployment testing.
 
-Sharing is off by default. Only the catalogue is exposed (`/api/tracks`, `/api/peer`, audio and art). Admin APIs stay private. Peers can be refreshed or removed at any time.
+## Spotify playlist search (optional)
 
-## Songs with several artists
+To enable **Request → Playlist → Search**, an administrator can open **Admin → Requests → Spotify settings** and enter their Spotify Developer **Client ID** and **Client Secret**. The password-style field is blank whenever the page loads; leave it blank when updating the Client ID to keep the previously saved secret. The saved secret is AES-GCM encrypted in the installation database, is never sent back to the browser, and is used only by the server for Spotify API access. To undo the admin configuration, select **Remove saved credentials**. If Spotify credentials are also configured as server environment variables, those continue to work when no administrator-saved credentials are present.
 
-A song tagged "The Interrupters, Rancid" is listed under both artists, and under its album on each of their pages.
-Artists are split on `;`  `/`  `,`  `feat.`  `ft.`  `featuring`  `vs`. A few names that contain those characters are protected
-(see `KEEP` in `src/index.js`, add your own there); `&` and `and` are never split. To fix one song, use Edit in the admin page:
-separate the artists with `;` (add a `;` at the end to keep a comma inside one name).
+**Docker / Portainer:** WASP automatically uses a generated, persistent installation secret to encrypt credentials saved from the administrator page. Keep the Docker application state volume backed up and avoid changing the installation secret after saving credentials. You do not need to enter Spotify credentials into Portainer if you use the administrator page.
 
-Track numbers come from the song's track tag. A song keeps its number (for example 3) even if it is the only song of that album in the library.
+**Cloudflare Workers:** To securely save credentials from the administrator page, first configure a persistent, random `SPOTIFY_SETTINGS_KEY` in the Worker's **Secrets** settings. For example, an authorized operator can use `npx wrangler secret put SPOTIFY_SETTINGS_KEY`. Store the key in your password manager and **never commit it to Git**. Changing or losing this key makes previously saved Spotify credentials unreadable; an administrator can then replace the saved secret. This is a one-time encryption-key requirement, not a requirement to put the Spotify credentials into Cloudflare secrets. Alternatively, you can continue to configure `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` as Worker secrets, with no admin database storage.
 
-## Lyrics
+**Security:** Open the administrator interface over **HTTPS** when entering credentials. Do not post your Client Secret publicly or expose it in screenshots. Spotify's API permissions, app quotas, development-mode restrictions, and rate limits still apply. The paste-link request option works even when playlist search is not configured. WASP does not download Spotify audio.
 
-The **Lyrics** button (microphone icon, right side of the player) opens a side panel. Two free sources are asked at the same time, with
-variations of the title and each artist on the song: LRCLIB (time-synced lyrics, the current line is highlighted and clicking a line jumps to it)
-and lyrics.ovh (plain lyrics). Synced lyrics are preferred, otherwise whatever plain lyrics were found. Results are cached in R2.
-Lyrics belong to their owners.
+## Local development
 
-## Requests
+1. Download or clone this repository.
+2. Install **Node.js** and **npm** if they are not already installed.
+3. Open a terminal in the project directory (the folder containing `package.json`).
+4. Run:
 
-The **Request** tab has two parts: **Queue** (everything waiting) and **Make a request**. Visitors pick Song, Artist or Album,
-type a name and choose from a dropdown of matches with pictures (from Deezer's public search, looked up again on the
-server so names and images can't be faked), or paste a Spotify playlist link. A request that is already queued shows a
-popup instead of being added, and so does one that is already in the library.
+   ```bash
+   npm install
+   npm run build:docs
+   npm run dev
+   ```
 
-Song, album and artist requests leave the queue automatically when a matching song is uploaded or edited. A playlist
-request leaves when you create a playlist with the same name (or remove it in Admin > Request queue).
-Limits: 10 requests per visitor and 20 per network per day, 500 waiting in total.
+5. Open the local URL printed by Wrangler in the terminal (usually `http://localhost:8787`).
 
-## Playlists, lyrics and reactions
+This runs the app locally for development. It does not publish your code or music to Cloudflare.
 
-- Playlists tab: hover a playlist's picture to get a round play button in its lower-right ninth; clicking the picture opens the playlist.
-- Lyrics button: 1st click opens the side panel, 2nd makes the lyrics full screen (above the page, below the player), 3rd closes them.
-  Up next can open on the right beside full-screen lyrics. Esc steps back one level.
-- Heart / like / dislike circles on artist and playlist pages (next to Radio / Shuffle). Most hearted, liked and disliked each have
-  Songs, Artists and Playlists sub tabs.
-- Lineup shows circular pictures of the members (Wikipedia photo, else Deezer when the name matches an artist there).
-- Admin > Playlists: search, 15 per page; **View** shows a playlist's songs (click to play, **Remove**, **Add song** with a library search).
+## Cloudflare Workers deployment (from GitHub)
 
-## Spotify playlist requests
+1. Open this WASP repository on **GitHub** and click **Fork** to make your own copy in your GitHub account. If you have downloaded the project instead, upload its files to a repository in your account. Keep `package.json` and `wrangler.jsonc` at the repository root.
+2. Log in to the [Cloudflare dashboard](https://dash.cloudflare.com/). Enable **R2** for your Cloudflare account if prompted; the webapp uses **R2** for music/artwork and **D1** for library data.
+3. Go to **Workers & Pages → Create application**, then choose **GitHub / Import a repository**.
+4. Authorize Cloudflare to access your GitHub account and select **your fork** of WASP.
+5. Configure the Worker build:
+   - **Root directory:** the repository root, where `package.json` and `wrangler.jsonc` are located.
+   - **Build command:** leave empty.
+   - **Deploy command:** `npm run deploy` (regenerates the admin release-notes viewer before deployment).
+   - **Worker name:** match the `name` in `wrangler.jsonc` (initially `musicwebapp`). If you choose a different Worker name, update that configuration before deploying.
+6. Click **Save and Deploy**. After a successful deployment, open the assigned `workers.dev` URL and verify that the app loads and its R2/D1 bindings have been provisioned correctly.
+7. **Immediately sign in and change the default admin password** before enabling network sharing or publicly promoting the site.
 
-Spotify's official API no longer lets apps read other people's playlists, so the name, picture and song list (roughly the first 50-100 songs)
-are read from the public Spotify embed page. That is unofficial and may stop working; the request is still queued without a song count if it fails.
-In Admin > Requests each playlist shows `matched/total` and how many songs are missing; the arrow lists them and **Refresh** reads the playlist again.
-When every song is in the library, the playlist is added to the Playlists tab (songs in Spotify's order, Spotify's picture as its cover) and the
-request moves to **Previous requests**. For long playlists use **Mark as done**, which does the same with the songs you have.
+Cloudflare can redeploy the Worker when changes are pushed to the connected GitHub branch. **If you already have a live Worker, create a separate project or deliberately configure the correct Worker name before connecting a new repository; do not accidentally overwrite a production deployment.**
 
-Finished requests are kept under Request > Previous requests (songs, albums, artists, playlists).
+## Docker deployment — Portainer (recommended)
 
-## Artist biography, genre and radio
+WASP can be hosted independently of Cloudflare, using Docker on a server, NAS, or other Docker-compatible host. The Docker Compose setup runs the app behind a web proxy in one container and keeps local application data in persistent Docker volumes.
 
-An artist page shows a short Wikipedia biography and the artist's genres (from Wikidata). Both are saved in the database the first time
-anyone opens the artist (uploads fetch them in advance), so later visitors get them instantly. Each time the artist is opened, Wikipedia is
-checked in the background and the saved copy is rewritten only if the page really changed. In Admin > Music collection, **Update artist bio**
-does the same check for every artist (and fills in genres).
+### 1. Add the Git repository as a Portainer source
 
-The **Radio** button on an artist page builds a queue of 30 or more songs from your library, starting with a song by that artist and mixing in
-other artists with related genres (it tops up from the rest of the library when too few match). It is a temporary queue, shown under Up next.
-On an artist page: tabs for **Biography**, **Lineup** (bands only, current members from the Wikipedia infobox) and **Similar artists**
-(Deezer; up to 9 shown plus a "show more" circle that opens the full list).
-Radio needs genres, so run **Update artist bio** once after deploying to fill them in for the artists you already have.
+1. Log in to **Portainer** and select the Docker environment where you want to run WASP.
+2. Open **Stacks → Add stack**.
+3. Enter a stack name, for example `riffvault`.
+4. Under **Build method**, select **Repository**.
+5. In the **Source** dropdown, click **+ Create new source** (as shown in Portainer's repository configuration screen).
+6. Fill in the **Configure Git Repository** form:
+   - **Source Name:** `riffvault-github` (or any recognizable name).
+   - **Repository URL:** the HTTPS URL of this repository or your own GitHub fork, such as `https://github.com/YOUR-USERNAME/YOUR-REPO`.
+   - **Authentication:** off for a public repository; configure Git credentials if the repository is private.
+   - **Skip TLS Verification:** leave off for GitHub.
+   - **Enable polling:** optional; turn it on only if you want Portainer to check the repository for updates automatically.
+7. Test/save the source if Portainer prompts you to do so.
 
-## Admin extras
+### 2. Create and deploy the stack
 
-- Songs are listed 30 per page, newest first, with page numbers and a search box.
-- Playlists: **Change image** sets your own cover (JPEG, PNG or WebP, up to 5 MB); **Use automatic** goes back to the album grid.
+1. Back on **Stacks → Add stack**, choose the newly created **Source** from the dropdown.
+2. Select the Git reference `refs/heads/main` (or your actual deployment branch).
+3. Set the **Compose path** to `docker-compose.yml` (relative to the repository root).
+4. Before deployment, use the **Environment variables** section to set the location of your existing music folder, as explained below.
+5. Click **Deploy the stack**. Portainer will retrieve the repository and build/start the Docker container.
+6. By default, open `http://YOUR-SERVER-IP:8080` or `https://YOUR-SERVER-IP:8443`. Before publicly using HTTPS, set `SITE_ADDRESS` and `DEFAULT_SNI` in the Portainer stack to your actual public IP or hostname (without protocol/port). `TLS_ARGS=internal` uses an internal certificate that browsers do not automatically trust; use a trusted HTTPS hostname/certificate for production.
+7. **Change the default admin password immediately**. Do not enable peer sharing or publish the server before doing so.
 
-## Clean database
+### 3. Map an existing folder containing music
 
-Admin > **Clean database** deletes every song, playlist, request, artwork file, play count and reaction. It asks for your
-password and the word `confirm`. Your admin login is kept.
+You **do not need to upload all your songs through the browser**. WASP can read an existing folder on your Docker host, including a NAS folder already mounted on that host.
 
-## Artwork
+In the Portainer stack's **Environment variables**, add:
 
-Album art comes from the cover embedded in your mp3; if there is none it is looked up on Deezer's public search API
-(no key) and cached in R2. Artist photos come from Deezer. Admin > **Refresh artwork** clears downloaded images.
-Images are third-party content.
+| Variable | Example value | Purpose |
+| --- | --- | --- |
+| `MUSIC_FOLDER` | `/mnt/storage/Music` | Absolute path to your existing music folder **on the Docker host**. |
 
-## Local dev
+The Compose file maps that folder into the container as `/music` **read-only**. WASP scans it and indexes its songs without moving or deleting the original files. Change `MUSIC_FOLDER` to your own path; for example:
 
-```
-npm install
-npx wrangler dev
-```
+- Linux server: `/srv/music`
+- NAS mount on the Docker host: `/mnt/nas/Music`
+- Synology-style path (when accessible to Docker): `/volume1/music`
 
-## Notes
+**Important:** Use an **absolute path on the machine running Docker**, not a path on your laptop unless that laptop is the Docker host. Make sure the folder exists and is readable by Docker. If your music is on another device, mount that share on the Docker host first.
 
-- Uploads are limited to 100 MB per file. Login: 5 failed attempts per IP per 15 minutes.
-- A play counts after 10 seconds. Hearts/likes/dislikes are one per visitor per song (tracked by a random id in the browser).
+The Docker container also has its own persistent application storage, separate from the host music folder. Songs uploaded through the webapp are handled by the application's local storage; files in `MUSIC_FOLDER` are only read and indexed. Your Cloudflare deployment, if you have one, is separate and is not changed by deploying Docker.
 
-## Run with Docker / Portainer (local)
+To change the folder later, update the stack's `MUSIC_FOLDER` environment variable in Portainer and redeploy. **Do not delete the application's Docker volumes** when updating the stack if you want to retain its existing data.
 
-This app is a Cloudflare Worker. The Docker image runs the same Worker code locally via Wrangler + Miniflare (local R2 + D1). Data is persisted in a Docker volume.
+---
 
-### Quick start (CLI)
-
-```bash
-# from the repo root
-docker compose up -d --build
-```
-
-Open http://localhost:8787
-
-Default admin login (change it immediately):
-
-- ID: `admin`
-- Password: `21232f297a57a5a743894a0e4a801fc3`
-
-Stop / remove:
-
-```bash
-docker compose down          # keep data volume
-docker compose down -v       # also delete music library
-```
-
-### Portainer (Git deploy)
-
-1. Push this repository to GitHub (or any Git remote).
-2. In Portainer → **Stacks** → **Add stack** → **Repository**.
-3. Repository URL: `https://github.com/YOUR_USER/music-app` (or your fork).
-4. Compose path: `docker-compose.yml`
-5. Deploy the stack.
-
-Portainer will build the image and start the container. The app listens on port **8787**.
-
-Map a host port if you want a different external port (edit the `ports` section in `docker-compose.yml` or override it in Portainer).
-
-### HTTPS (required for admin login away from localhost)
-
-The admin session cookie is marked `Secure`, so browsers only keep it over HTTPS (plain `http://localhost` is the one exception). If you open the app via a LAN IP or hostname over `http://`, the login "succeeds" but you stay logged out. Enable the built-in HTTPS proxy (Caddy):
-
-```bash
-docker compose --profile https up -d --build
-```
-
-Open **https://localhost:8443** (or `https://<server-ip>:8443`). In Portainer, add the environment variable `COMPOSE_PROFILES=https` to the stack instead.
-
-Settings (all optional – see `.env.example`):
-
-| Variable       | Default     | Meaning |
-|----------------|-------------|---------|
-| `HTTPS_PORT`   | `8443`      | Host port for HTTPS (use `443` for a public domain) |
-| `SITE_ADDRESS` | `localhost` | Name(s)/IP(s) you browse to, comma separated, e.g. `music.lan, 192.168.1.50` |
-| `DEFAULT_SNI`  | = `SITE_ADDRESS` | Only set if `SITE_ADDRESS` lists several names: the one to use when browsing by bare IP |
-| `TLS_ARGS`     | `internal`  | `internal` = self-signed; `you@example.com` = Let's Encrypt; `/certs/cert.pem /certs/key.pem` = your own certificate |
-| `CERT_DIR`     | named volume | Absolute host folder holding `cert.pem` + `key.pem` (own-certificate mode) |
-| `APP_BIND`     | `0.0.0.0`   | Set to `127.0.0.1` to hide the plain-HTTP port from the network |
-
-**Self-signed (default):** the browser shows a certificate warning until you trust Caddy's local CA. Export it with
-`docker cp music-app-https:/data/caddy/pki/authorities/local/root.crt .` and import it into your OS/browser trust store (or just accept the warning).
-
-**Let's Encrypt:** point a public DNS name at your server, forward port 443 to the host, then set `SITE_ADDRESS=music.example.com`, `TLS_ARGS=you@example.com`, `HTTPS_PORT=443`.
-
-Recommended with HTTPS: set `APP_BIND=127.0.0.1`. Login rate limiting then works per real client IP (the proxy passes it on) instead of treating everyone as one visitor.
-
-### Data persistence
-
-| Path inside container          | Content                          | Docker volume      |
-|--------------------------------|----------------------------------|--------------------|
-| `/app/.wrangler/state`         | Local R2 objects + D1 SQLite     | `music-app-data`   |
-
-Uploads, playlists, settings and sessions survive container restarts as long as the volume is kept.
-
-### Notes for Docker
-
-- This is a **local development / self-hosted** setup. It is not the Cloudflare production runtime.
-- Large libraries need enough disk space on the Docker host (mp3s live in the volume).
-- The first request creates the D1 tables automatically (same as on Cloudflare).
-- Network / peer-to-peer features work between instances that can reach each other over the network.
+**Before sharing your library with anyone:** sign in, change the default administrator password, and only then enable **Admin → Network → Share this library on the network**. Keep your server and credentials secure.
